@@ -693,13 +693,20 @@ class VideoViewer(_PlayerViewer):
 class ForwardViewer(_BaseViewer):
     """转发消息查看器：渲染 forward_archive.content_text（逐条 [时间] 昵称: 内容）。
 
-    status: ok=展开成功 / pending=拉取中 / failed=当时拉取失败(URL过期) / empty=空。
+    status: ok=展开成功 / pending=拉取中 / failed=当时拉取失败 / empty=空。
     子消息内的图片为占位符 [图片]（子图未单独落库）。
+
+    08-23「重试拉取」：failed/empty 状态提供重拉按钮（POST /forward/refetch）。
+    forward_id 在 QQ 服务器长期有效——HTTP 通道当时挂死/未启用留下的
+    failed 行，通道恢复（或 WS 反向兜底）后随时可救回，不再是终态。
     """
+
+    _FWD_ID_RE = re.compile(r"CQ:forward,id=(\d+)")
 
     _STATUS_TIP = {
         "pending": "转发内容正在后台拉取，稍后再试",
-        "failed": "转发内容当时拉取失败（QQ 转发 URL 有时效性，过期后不可恢复）",
+        "failed": "转发内容当时拉取失败（HTTP 通道不可用）——"
+                  "forward_id 长期有效，可点下方「重试拉取」救回",
         "empty": "转发内容为空",
     }
 
@@ -720,12 +727,21 @@ class ForwardViewer(_BaseViewer):
         self.browser.setOpenExternalLinks(False)
         v.addWidget(self.browser, 1)
         bar = QHBoxLayout()
+        self.btn_retry = QPushButton("重试拉取")
+        self.btn_retry.setStyleSheet(_BTN_QSS)
+        self.btn_retry.clicked.connect(self._do_refetch)
+        self.btn_retry.hide()  # 仅 failed/empty 状态显示
         self.btn_copy = QPushButton("复制全部")
         self.btn_copy.setStyleSheet(_BTN_QSS)
         self.btn_copy.clicked.connect(self._copy_all)
         bar.addStretch(1)
+        bar.addWidget(self.btn_retry)
         bar.addWidget(self.btn_copy)
         v.addLayout(bar)
+
+    def _fwd_id(self) -> str:
+        m = self._FWD_ID_RE.search(self.row.get("raw_message") or "")
+        return m.group(1) if m else ""
 
     def _load(self):
         mid, tid = self.row["message_id"], self.row["target_id"]
@@ -737,6 +753,7 @@ class ForwardViewer(_BaseViewer):
             self.lb_head.setText("无转发存档记录（存档功能上线前 / 记录缺失）")
             self.browser.setHtml(self._empty_html("该转发消息没有存档记录"))
             self.btn_copy.setEnabled(False)
+            self.btn_retry.hide()
             return
         r = rows[0]
         status = r.get("status") or "unknown"
@@ -751,11 +768,52 @@ class ForwardViewer(_BaseViewer):
                 f"{body}</div>")
             self._all_text = r["content_text"]
             self.btn_copy.setEnabled(True)
+            self.btn_retry.hide()
         else:
             tip = self._STATUS_TIP.get(status, f"未知状态：{status}")
             self.lb_head.setText(f"状态：{status}")
             self.browser.setHtml(self._empty_html(tip))
             self.btn_copy.setEnabled(False)
+            # failed/empty + 能从消息里取到 forward_id → 显示重试按钮
+            if status in ("failed", "empty") and self._fwd_id():
+                self.btn_retry.show()
+                self.btn_retry.setEnabled(True)
+            else:
+                self.btn_retry.hide()
+
+    def _do_refetch(self):
+        fwd_id = self._fwd_id()
+        if not fwd_id:
+            return
+        self.btn_retry.setEnabled(False)
+        self.lb_head.setText("正在重新拉取转发内容（HTTP / WS 反向通道）…")
+        payload = {
+            "forward_id": fwd_id,
+            "message_id": self.row.get("message_id", 0),
+            "message_type": self.row.get("message_type", "group"),
+            "target_id": self.row.get("target_id", 0),
+            "user_id": self.row.get("user_id", 0),
+            "nickname": self.row.get("nickname", ""),
+        }
+        w = Worker(api_client.forward_refetch, self.mw.cfg, payload)
+        w.finished_ok.connect(lambda r: self._on_refetch_done(r))
+        w.finished_err.connect(lambda e: self._on_refetch_err(e))
+        w.start()
+        self._track(w)
+
+    def _on_refetch_done(self, result):
+        self.btn_retry.setEnabled(True)
+        if result.get("status") == "ok":
+            n = result.get("msg_count", 0)
+            self.lb_head.setText(f"✅ 重新拉取成功（{n} 条子消息），重新渲染…")
+            self._load()
+        else:
+            self.lb_head.setText("❌ 重新拉取仍失败，请稍后再试（或检查 NapCat 通道）")
+            self._load()
+
+    def _on_refetch_err(self, err):
+        self.btn_retry.setEnabled(True)
+        self.lb_head.setText(f"❌ 重试请求失败: {str(err)[:120]}")
 
     @staticmethod
     def _empty_html(tip: str) -> str:

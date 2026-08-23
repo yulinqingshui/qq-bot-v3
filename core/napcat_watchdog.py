@@ -78,6 +78,27 @@ async def check_http_healthy() -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {str(e)[:80]}"
 
 
+async def ws_healthy(timeout: float = 10.0) -> bool:
+    """WS 反向 get_login_info 探活（08-23）。
+
+    WS 是 bot 的命脉——WS 反向 action 成功 = NapCat 进程活着 +
+    QQ 客户端在线 + WS 通道可双向通信（与 HTTP 通道配置无关）。
+    用途：
+      - 转发预检：WS 健康时 HTTP 不健康属「httpServers 未启用」，
+        不重启容器（重启无效，拉取本身有 WS 兜底）
+      - 守护告警：WS 健康时 HTTP 连续失败不再误报「登录态失效待扫码」
+    """
+    from . import sender
+    if not sender.ws_connected():
+        return False
+    try:
+        resp = await sender.request_action("get_login_info", timeout=timeout)
+        return resp.get("status") == "ok" and bool(resp.get("data"))
+    except Exception as e:
+        logger.debug(f"WS 反向 get_login_info 探活失败: {e}")
+        return False
+
+
 async def wait_healthy(timeout: float = _RECOVER_WAIT,
                        poll: float = 10.0) -> tuple[bool, float]:
     """轮询等待 HTTP 服务恢复（重启后调用）。返回 (恢复?, 耗时秒)。"""
@@ -356,9 +377,16 @@ async def watchdog_loop() -> None:
             logger.debug(f"🐱 NapCat 守护: HTTP 探活失败 {fail_streak}/{threshold} "
                          f"（{detail}）")
             continue
-        # 达到阈值：区分「待扫码」「服务真挂死」「持续恶化」
+        # 达到阈值：区分「待扫码」「HTTP 未启用/挂死」「持续恶化」
         # 2026-08-23：待扫码时告警文案完全不同（引导扫码而非"HTTP 挂死"）
         scan_pending = await awaiting_login_scan()
+        # 08-23 双通道判定（转发拉取事故复盘）：WS 反向探活成功 =
+        # QQ 登录态确定有效（WS 是 bot 命脉，bot 能跑 QQ 就在线）——
+        # 此时 HTTP 连续失败属「httpServers 未启用/服务未起」（配置问题），
+        # 二维码 marker 可能是旧残留，不能据此误报「登录态失效待扫码」
+        ws_ok = await ws_healthy()
+        if ws_ok:
+            scan_pending = False
         if fail_streak == threshold:
             if scan_pending:
                 logger.warning(
@@ -366,6 +394,15 @@ async def watchdog_loop() -> None:
                     f"（连续 {fail_streak} 次探活失败属预期）。"
                     f"处理: 打开 GUI 总览页 NapCat 卡片「刷新二维码」→ 手Q 扫码。"
                     f"自动重启对登录态失效无效，已自动跳过。")
+            elif ws_ok:
+                # 08-23：WS 健康 + HTTP 挂 = httpServers 未启用（非登录态问题）
+                logger.warning(
+                    f"🚨 NapCat 守护: HTTP 服务连续 {fail_streak} 次探活失败"
+                    f"（{detail}）——但 WS 通道正常（QQ 登录态有效，消息收发不受影响），"
+                    f"判定为当前登录账号的 onebot11 配置 httpServers 未启用。"
+                    f"转发存档已自动走 WS 反向通道兜底。"
+                    f"如需恢复 HTTP: 检查 NapCat 容器内该账号 onebot11_*.json 的 httpServers。"
+                    f"[判定依据: ws_healthy=True, scan_pending 被 WS 证据否决]")
             else:
                 # 08-23 判定依据日志（14:51 误杀无据可查的教训）：
                 # 明确记录 scan_pending 判定结果 + 命中依据 + 探活详情，
@@ -380,12 +417,16 @@ async def watchdog_loop() -> None:
                 logger.warning(
                     f"⏳ NapCat 守护: 仍待扫码（已 {fail_streak} 次探活失败）——"
                     f"请尽快 GUI 扫码，bot 当前无法收发消息")
+            elif ws_ok:
+                logger.warning(f"🚨 NapCat 守护: HTTP 服务仍不可用（已失败 {fail_streak} 次，WS 通道正常，"
+                               f"转发走 WS 兜底，见首次告警的修复指引）")
             else:
                 logger.warning(f"🚨 NapCat 守护: HTTP 服务仍不健康（已失败 {fail_streak} 次）")
         # 自动重启判定（2026-08-23：待扫码时直接跳过——重启救不了登录态，
-        # 此前每个 tick 刷一对「触发自动重启…/未执行重启（待扫码）」噪音日志）
+        # 此前每个 tick 刷一对「触发自动重启…/未执行重启（待扫码）」噪音日志；
+        # WS 健康时同样跳过——httpServers 未启用是配置问题，重启救不了）
         auto = _cfg("NAPCAT_WATCHDOG_AUTO_RESTART", _DEFAULT_AUTO_RESTART)
-        if not auto or scan_pending:
+        if not auto or scan_pending or ws_ok:
             continue
         logger.warning("🐱 NapCat 守护: 触发自动重启（docker restart）…")
         r = await request_restart()

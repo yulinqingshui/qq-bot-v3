@@ -118,6 +118,15 @@ def _consume_ws_event(data: dict) -> bool:
     return False
 
 
+def ws_connected() -> bool:
+    """NapCat WS 连接是否存活（08-23：转发预检 / 守护双通道判定用）。
+
+    WS 是 bot 的命脉——WS 断则 bot 本身无法工作，所以 WS 存活 =
+    NapCat 进程活着且 QQ 客户端在线（HTTP 通道是否启用与此无关）。
+    """
+    return _active_websocket is not None
+
+
 def get_login_info_sync(timeout: float = 10.0) -> Optional[dict]:
     """线程安全版 get_login_info（GUI/后台线程调用）。
 

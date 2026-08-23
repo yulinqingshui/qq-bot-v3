@@ -99,6 +99,15 @@ def napcat_logout(cfg: dict) -> dict:
     return _request(cfg, "POST", "/napcat/logout", {}, timeout=180)
 
 
+def forward_refetch(cfg: dict, payload: dict) -> dict:
+    """重新拉取一条转发存档（GUI 转发查看器「重试拉取」，08-23）。
+
+    HTTP 挂死/未启用时 failed 的记录，通道恢复（或 WS 反向兜底）后
+    可救回——forward_id 在 QQ 服务器长期有效。
+    """
+    return _request(cfg, "POST", "/forward/refetch", payload, timeout=90)
+
+
 def request_restart(cfg: dict) -> dict:
     return _request(cfg, "POST", "/restart", {})
 

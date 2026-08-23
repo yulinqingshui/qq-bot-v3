@@ -397,6 +397,13 @@ async def _ensure_napcat_for_fetch(forward_id: str) -> None:
     healthy, detail = await napcat_watchdog.check_http_healthy()
     if healthy:
         return
+    # 08-23：WS 反向探活——WS 健康 = QQ 登录态有效（bot 能跑 QQ 就在线），
+    # HTTP 不健康属「httpServers 未启用/服务未起」（配置问题），重启救不了；
+    # 此时不重启、不空等，拉取本身有 WS 反向兜底（fetch_forward_content）
+    if await napcat_watchdog.ws_healthy():
+        logger.info(f"📎 转发预检: HTTP 服务不可用（{detail}）但 WS 通道正常"
+                    f"（判定为 httpServers 未启用，不重启），直接拉取（含 WS 兜底）")
+        return
     auto = CONFIG.get("NAPCAT_WATCHDOG_AUTO_RESTART", False)
     if not auto:
         logger.info(f"📎 转发预检: NapCat HTTP 服务不健康（{detail}），"
@@ -433,7 +440,11 @@ def _parse_forward_messages(messages: list, pending_map: Optional[dict] = None) 
         for m in msgs or []:
             user_id = m.get("user_id", 0)
             sender = m.get("sender", {}) or {}
-            nick = sender.get("nickname", "") or sender.get("card", "") or str(user_id)
+            # 08-23：WS 反向 get_forward_msg 的 sender.nickname 是 "QQ用户"
+            # 占位（不解析真实昵称）——占位值视为空，回落到 QQ 号显示
+            raw_nick = (sender.get("nickname", "") or
+                        sender.get("card", "") or "")
+            nick = raw_nick if raw_nick not in ("", "QQ用户") else str(user_id)
             ts = m.get("time", 0)
             msg = m.get("message", "")
             node = {
@@ -545,8 +556,12 @@ async def fetch_forward_content(forward_id: str, _depth: int = 0,
     if _cache is None:
         _cache = {}
     from .config import CONFIG
+    from . import sender
+    messages = None
     napcat_http = CONFIG.get("NAPCAT_HTTP", "http://127.0.0.1:3000")
     url = f"{napcat_http}/get_forward_msg"
+    # 通道 1：NapCat HTTP（快，但依赖 onebot11 配置启用了 httpServers——
+    # 未启用时连接被 RST，08-23 实测 1ms 断连）
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, params={"id": forward_id})
@@ -558,27 +573,43 @@ async def fetch_forward_content(forward_id: str, _depth: int = 0,
             logger.warning(f"forward {forward_id} API 返回非 ok: {data.get('retcode')}")
             return [], [], 0
         messages = (data.get("data") or {}).get("messages", [])
-        if not messages:
-            return [], [], 0
-
-        # 第一轮：解析出未展开的嵌套 forward_id
-        nodes, lines, pending = _parse_forward_messages(messages)
-        if pending:
-            # 递归拉取所有嵌套转发（缓存去重）
-            pending_map = {}
-            for fid in pending:
-                if fid in _cache:
-                    sub_nodes, sub_lines, _ = _cache[fid]
-                else:
-                    sub_nodes, sub_lines, _ = await fetch_forward_content(fid, _depth + 1, _cache)
-                    _cache[fid] = (sub_nodes, sub_lines, len(sub_nodes))
-                pending_map[fid] = (sub_nodes, sub_lines)
-            # 第二轮：带 pending_map 重新解析，展开嵌套内容
-            nodes, lines, _ = _parse_forward_messages(messages, pending_map)
-        return nodes, lines, len(nodes)
     except Exception as e:
-        logger.warning(f"forward {forward_id} 拉取异常: {e}")
+        logger.info(f"forward {forward_id} HTTP 拉取失败（{type(e).__name__}），"
+                    f"尝试 WS 反向通道…")
+    # 通道 2：WS 反向 action（08-23 实测验证——HTTP 全死时纯 WS 拉回 21 条
+    # 子消息。WS 是 bot 命脉，此通道对任何账号/HTTP 配置状态都成立）
+    if not messages:
+        try:
+            resp = await sender.request_action(
+                "get_forward_msg", {"id": forward_id}, timeout=30)
+            if resp.get("status") != "ok":
+                logger.warning(f"forward {forward_id} WS 拉取返回非 ok: "
+                               f"{resp.get('retcode')} {str(resp.get('msg', ''))[:120]}")
+                return [], [], 0
+            messages = (resp.get("data") or {}).get("messages", [])
+            if messages:
+                logger.info(f"forward {forward_id} WS 反向通道拉取成功 "
+                            f"({len(messages)} 条子消息)")
+        except Exception as e:
+            logger.warning(f"forward {forward_id} WS 拉取异常: {e}")
+    if not messages:
         return [], [], 0
+
+    # 第一轮：解析出未展开的嵌套 forward_id
+    nodes, lines, pending = _parse_forward_messages(messages)
+    if pending:
+        # 递归拉取所有嵌套转发（缓存去重）
+        pending_map = {}
+        for fid in pending:
+            if fid in _cache:
+                sub_nodes, sub_lines, _ = _cache[fid]
+            else:
+                sub_nodes, sub_lines, _ = await fetch_forward_content(fid, _depth + 1, _cache)
+                _cache[fid] = (sub_nodes, sub_lines, len(sub_nodes))
+            pending_map[fid] = (sub_nodes, sub_lines)
+        # 第二轮：带 pending_map 重新解析，展开嵌套内容
+        nodes, lines, _ = _parse_forward_messages(messages, pending_map)
+    return nodes, lines, len(nodes)
 
 
 async def archive_forward(message_id: int, message_type: str, target_id: int,

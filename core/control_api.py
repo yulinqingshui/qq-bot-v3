@@ -451,9 +451,105 @@ async def _h_llm_usage(request):
 
 
 async def _h_llm_recent(request):
-    """GET /llm/recent — 最近一次 LLM 请求摘要（GUI 总览页"最近请求"行）。"""
+    """GET /llm/recent — LLM 用量统计（最近一次请求摘要，GUI 总览页"最近请求"行）。"""
     from . import llm_usage
     return web.json_response(llm_usage.get_recent_request())
+
+
+async def _h_forward_refetch(request):
+    """POST /forward/refetch — 重新拉取一条转发存档（GUI「重试拉取」按钮，08-23）。
+
+    背景：HTTP 通道挂死/未启用时，当时拉取失败的转发会留 failed 行
+    （content_json 为空）。forward_id 在 QQ 服务器长期有效，通道恢复
+    （或走 WS 反向兜底）后随时可救回——历史 failed 记录不再是终态。
+
+    body {forward_id, message_id, message_type, target_id, user_id, nickname}
+    走 archive.archive_forward（自带 ok 行去重；failed 行会重新拉取并
+    写新行，GUI 按 fetched_at DESC 取最新）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    fwd_id = str(body.get("forward_id", ""))
+    if not fwd_id:
+        return web.json_response({"ok": False, "error": "缺少 forward_id"},
+                                 status=400)
+    from . import archive
+    try:
+        await archive.archive_forward(
+            message_id=int(body.get("message_id") or 0),
+            message_type=str(body.get("message_type") or "group"),
+            target_id=int(body.get("target_id") or 0),
+            user_id=int(body.get("user_id") or 0),
+            nickname=str(body.get("nickname") or ""),
+            forward_id=fwd_id,
+        )
+    except Exception as e:
+        return web.json_response({"ok": False,
+                                  "error": f"{type(e).__name__}: {str(e)[:200]}"})
+    # 拉取结果以库里最新行为准（ok/failed 由 archive_forward 落库）
+    try:
+        from .config import CONFIG as _CFG
+        from core.database import get_db as _get_db
+        with _get_db() as conn:
+            row = conn.execute(
+                "SELECT status, msg_count, fetched_at FROM forward_archive "
+                "WHERE forward_id = ? ORDER BY fetched_at DESC LIMIT 1",
+                (fwd_id,)).fetchone()
+        return web.json_response({
+            "ok": True,
+            "status": row[0] if row else "unknown",
+            "msg_count": row[1] if row else 0,
+            "fetched_at": row[2] if row else 0,
+        })
+    except Exception as e:
+        return web.json_response({"ok": True, "status": "unknown",
+                                  "error": f"状态回读失败: {e}"})
+
+
+async def _h_test_forward(request):
+    """POST /test/forward — WS 反向通道拉取转发（诊断用，08-23 转正）。
+
+    body {id}: forward_id。直接走 WS 反向 action get_forward_msg
+    （不经过 NapCat HTTP）。返回子消息数 + 前 10 条预览。
+    与 /forward/refetch 的区别：本端点只读不落库（诊断），
+    refetch 走完整 archive 链路（落库 + 图片归档）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    fwd_id = str(body.get("id", ""))
+    if not fwd_id:
+        return web.json_response({"ok": False, "error": "缺少 id"})
+    from . import sender
+    try:
+        resp = await sender.request_action("get_forward_msg", {"id": fwd_id},
+                                           timeout=30)
+    except Exception as e:
+        return web.json_response({"ok": False,
+                                  "error": f"{type(e).__name__}: {str(e)[:200]}"})
+    if resp.get("status") != "ok":
+        return web.json_response({"ok": False, "retcode": resp.get("retcode"),
+                                  "msg": str(resp.get("msg", ""))[:200]})
+    messages = (resp.get("data") or {}).get("messages", [])
+    preview = []
+    for m in messages[:10]:
+        s = m.get("sender", {}) or {}
+        msg = m.get("message", "")
+        if isinstance(msg, list):
+            text = "".join(seg.get("data", {}).get("text", "")
+                           for seg in msg if seg.get("type") == "text")
+        else:
+            text = str(msg)
+        # 08-23：WS 反向返回的 nickname 是 "QQ用户" 占位 → 回落 QQ 号
+        nick = s.get("nickname", "")
+        nick = nick if nick not in ("", "QQ用户") else str(m.get("user_id", ""))
+        preview.append({"nickname": nick, "user_id": m.get("user_id"),
+                        "time": m.get("time"), "text": text[:100]})
+    return web.json_response({"ok": True, "msg_count": len(messages),
+                              "preview": preview})
 
 
 # ============================================================
@@ -707,6 +803,8 @@ async def start_control_api():
     app.router.add_get("/napcat", _h_napcat)
     app.router.add_post("/napcat/restart", _h_napcat_restart)
     app.router.add_post("/napcat/logout", _h_napcat_logout)
+    app.router.add_post("/test/forward", _h_test_forward)
+    app.router.add_post("/forward/refetch", _h_forward_refetch)
     app.router.add_post("/restart", _h_restart)
     runner = web.AppRunner(app)
     await runner.setup()
