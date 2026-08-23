@@ -2244,6 +2244,15 @@ class TabOverview(QWidget):
 
         def _ok(r):
             url, token = r["url"], r.get("token", "")
+            # 08-24 新增：打开控制台时自动复制 token 到剪贴板（内嵌/外部浏览器共用）
+            if token:
+                try:
+                    QApplication.clipboard().setText(token)
+                    self.mw.statusBar().showMessage(
+                        f"NapCat token 已复制到剪贴板（{len(token)} 字符）", 5000)
+                except Exception as _e:
+                    self.mw.statusBar().showMessage(
+                        f"token 复制失败: {_e}", 4000)
             try:
                 from PySide6.QtWidgets import QDialog
                 from PySide6.QtWebEngineWidgets import QWebEngineView
