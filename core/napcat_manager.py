@@ -280,11 +280,22 @@ def _build_status(running: bool, hint: str, qrcode_b64: str = "",
             sf = os.path.join(os.path.dirname(os.path.dirname(__file__)),
                               "data", "napcat_status.txt")
             if os.path.exists(sf):
-                with open(sf, encoding="utf-8") as f:
-                    for line in f:
-                        if line.startswith("account:"):
-                            account = line.partition(":")[2].strip()
-                            break
+                # 08-24 编码修复：bot.py 写文件强制 UTF-8；历史 GBK 文件
+                # UTF-8 解码失败时回退 GBK，避免 account 中文昵称变乱码/空
+                raw = open(sf, "rb").read()
+                text = None
+                for enc in ("utf-8", "gbk"):
+                    try:
+                        text = raw.decode(enc)
+                        break
+                    except (UnicodeDecodeError, LookupError):
+                        continue
+                if text is None:
+                    text = raw.decode("utf-8", errors="replace")
+                for line in text.splitlines():
+                    if line.startswith("account:"):
+                        account = line.partition(":")[2].strip()
+                        break
         except OSError:
             pass
     info: dict = {
@@ -783,6 +794,55 @@ class WinGreenBackend:
         return (os.path.isfile(self._node_exe())
                 and os.path.isfile(os.path.join(self.pkg_dir, "index.js")))
 
+    # wrapper.node 硬依赖的 DLL（2026-08-24 真机实测根因）
+    _WRAPPER_REQUIRED_DLLS = ("crypto.dll", "ssl.dll")
+
+    def _patch_green_dlls(self) -> list:
+        """补齐官方绿色版缺失的 crypto.dll/ssl.dll（幂等）。
+
+        根因（2026-08-24 实测）：NapCat 官方 Windows 绿色版 zip
+        （NapCat.Shell.Windows.Node.zip, v4.18.19）漏打包 wrapper.node
+        硬依赖的两个 OpenSSL DLL——wrapper.node 的 PE 导入表需要
+        crypto.dll + ssl.dll（QQNT 自研 OpenSSL 构建，符号集 259+89），
+        缺文件时 node 加载 wrapper.node 直接报
+        `The specified module could not be found`，NapCat worker 三连炸。
+
+        Win11 上 node.exe 只搜 可执行文件目录 + 系统目录，系统里没有
+        腾讯的 crypto.dll/ssl.dll → 必须放在绿色版目录（与 wrapper.node
+        同层）。来源：QQ 官方完整安装包
+        （QQ_9.9.33_260813_x64_01.exe 内 resources/app/crypto.dll +
+        ssl.dll，已验证导出符号 100% 覆盖 wrapper.node 导入需求）。
+
+        本方法优先从发行包内置的 win_deps/ 目录复制（发行 zip 已附带），
+        找不到时返回缺失列表让调用方明确报错。
+        """
+        missing = [d for d in self._WRAPPER_REQUIRED_DLLS
+                   if not os.path.isfile(os.path.join(self.pkg_dir, d))]
+        if not missing:
+            return []
+        # 内置依赖目录：发行包结构 qq-bot-v3-win/win_deps/（core 在其下一层）
+        candidates = [
+            os.path.join(os.path.dirname(os.path.dirname(
+                os.path.abspath(__file__))), "win_deps"),
+            os.path.join(os.getcwd(), "win_deps"),
+        ]
+        import shutil
+        for src_dir in candidates:
+            for dll in list(missing):
+                src = os.path.join(src_dir, dll)
+                if not os.path.isfile(src):
+                    continue
+                try:
+                    shutil.copy2(src, os.path.join(self.pkg_dir, dll))
+                    missing.remove(dll)
+                    log.info(f"🔧 绿色版缺 {dll}，已从 {src} 补齐")
+                except OSError as e:
+                    log.warning(f"补齐 {dll} 失败: {e}")
+        if missing:
+            log.warning(f"绿色版仍缺 DLL: {missing}（发行包 win_deps/ 内无备份，"
+                        f"可手动从 QQ 安装目录 resources/app/ 复制到 {self.pkg_dir}）")
+        return missing
+
     def _patch_napcat_mjs(self) -> None:
         """修复官方绿色版的 --no-sandbox 崩溃（2026-08-23 真机实测根因）。
 
@@ -865,6 +925,13 @@ class WinGreenBackend:
             return {"ok": False, "error": f"解压失败: {e}"}
         if not self._green_ready():
             return {"ok": False, "error": "解压完成但未找到 node.exe/index.js（版本结构有变，请检查 release）"}
+        # 官方绿色版漏打包 wrapper.node 依赖的 OpenSSL DLL（crypto/ssl），
+        # 启动前必须补齐，否则 node 加载 wrapper.node 报
+        # "The specified module could not be found"
+        missing = self._patch_green_dlls()
+        if missing:
+            return {"ok": False, "error": f"绿色版缺依赖 DLL: {missing}（已尝试从发行包 win_deps/ 补齐失败，"
+                                           f"请手动从 QQ 安装目录 resources/app/ 复制）"}
         log.info(f"✅ NapCat Windows 绿色版就绪: {self.pkg_dir}")
         return {"ok": True, "message": f"绿色版下载完成（{self.pkg_dir}）"}
 
@@ -876,16 +943,64 @@ class WinGreenBackend:
         onebot11.json——账号登录后 NapCat 找不到 onebot11_<uin>.json 会回落
         默认文件并自动 save() 成该账号的（configLoader 源码确认），
         与 docker 后端行为对齐，且不再依赖 bot.qq 配置。
-        落点: <workdir>/NapCat/config/onebot11.json（幂等，已存在不覆盖）
+
+        08-24 修正落点：绿色版 NapCat 经 NAPCAT_WORKDIR 重定位后
+        实际读 <data_dir>/config/onebot11*.json（v4.18.19 napcat.mjs
+        pathWrapper 源码确认），原写 <data_dir>/NapCat/config/ 位置
+        NapCat 不读 → 登录后落盘空网络账号配置 → 登进 QQ 却连不进
+        bot（08-24 现场故障根因）。同时新增空网络账号配置自愈：
+        历史遗留的 onebot11_<uin>.json 空壳（httpServers/websocketClients
+        全空）启动时自动用默认网络配置覆盖（原文件备份 .pre_fix）。
         """
-        cfg_dir = os.path.join(self.data_dir, "NapCat", "config")
+        cfg_dir = os.path.join(self.data_dir, "config")
         listen_port = int(CONFIG.get("LISTEN_PORT", 8696))
-        _write_default_onebot11(cfg_dir, f"ws://127.0.0.1:{listen_port}/")
+        ws_url = f"ws://127.0.0.1:{listen_port}/"
+        _write_default_onebot11(cfg_dir, ws_url)
+        self._heal_empty_account_configs(cfg_dir, ws_url)
+
+    def _heal_empty_account_configs(self, cfg_dir: str, ws_url: str) -> None:
+        """空网络账号配置自愈：onebot11_<uin>.json 网络段全空 → 注入默认。
+
+        背景（08-24 现场）：早期版本默认配置写错目录（NapCat/config），
+        账号登录时 NapCat 找不到默认文件 → 落盘空网络账号配置 →
+        WS/HTTP 全断，bot 探活失败误报「登录态失效」。本方法扫描
+        <cfg_dir>/onebot11_*.json，网络段空（无 httpServers 且无
+        websocketClients）则用 _build_onebot11_config(ws_url) 覆盖，
+        原文件备份 <name>.pre_fix（幂等：非空网络不动，尊重手工配置）。
+        """
+        if not os.path.isdir(cfg_dir):
+            return
+        default_net = _build_onebot11_config(ws_url)
+        for f in sorted(os.listdir(cfg_dir)):
+            if not (f.startswith("onebot11_") and f.endswith(".json")):
+                continue
+            p = os.path.join(cfg_dir, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                net = data.get("network") or {}
+                if (net.get("httpServers") or net.get("websocketClients")):
+                    continue  # 已有网络配置（含手工/其他桥），不动
+                bak = p + ".pre_fix"
+                if not os.path.exists(bak):
+                    os.replace(p, bak)
+                with open(p, "w", encoding="utf-8") as fh:
+                    json.dump(default_net, fh, ensure_ascii=False, indent=2)
+                log.warning(f"🔧 onebot11 账号配置空网络已自愈: {f}（原文件备份 .pre_fix）")
+            except Exception as e:
+                log.warning(f"⚠️ 自愈 onebot11 配置失败 {f}: {e}")
 
     # ---- 进程管理 ----
     def _spawn(self) -> str:
         if not self._green_ready():
             return "绿色版未就绪（先点刷新触发下载，或手动解压到 napcat.win_package_dir）"
+        # 启动前兜底补齐官方绿色版缺失的 crypto.dll/ssl.dll
+        # （新版本官方若已打包则幂等跳过；缺失且发行包无备份时明确报错）
+        missing = self._patch_green_dlls()
+        if missing:
+            return (f"绿色版缺依赖 DLL: {missing}（wrapper.node 加载失败，"
+                    f"已尝试从发行包 win_deps/ 补齐但无备份；"
+                    f"请手动把 QQ 安装目录 resources/app/ 下的同名文件复制到 {self.pkg_dir}）")
         os.makedirs(self.data_dir, exist_ok=True)
         self._write_onebot_config()
         self._patch_napcat_mjs()
@@ -931,6 +1046,14 @@ class WinGreenBackend:
         if not running and not self._green_ready():
             return _build_status(
                 False, f"Windows 绿色版未安装（{self.pkg_dir}），点「刷新二维码」触发自动下载",
+                backend=self.name)
+        # 绿色版就绪但缺 wrapper.node 依赖 DLL：状态直接提示（启动也会失败）
+        missing = [d for d in self._WRAPPER_REQUIRED_DLLS
+                   if not os.path.isfile(os.path.join(self.pkg_dir, d))]
+        if missing and not self._alive():
+            return _build_status(
+                False, f"绿色版缺依赖 DLL: {missing}（官方包漏打包），"
+                       f"已自动尝试从发行包 win_deps/ 补齐，仍缺失需手动处理",
                 backend=self.name)
         b64, mtime = _find_qr(self.data_dir)
         return _build_status(running, "", b64, mtime, backend=self.name)
@@ -1034,6 +1157,27 @@ class WinGreenBackend:
                 "cleared": notes,
                 "message": "已注销并清空全部登录凭证，点「刷新二维码」重新启动并扫码"
                            "（原有账号也需重新扫码，可扫任意账号）"}
+
+    def stop(self) -> dict:
+        """停绿色版进程（bot 退出收尾用；不清登录凭据，与 logout 区分）。
+
+        2026-08-24 孤儿进程修复：GUI 关窗选「停止 bot」或 bot 进程任何
+        路径退出时，node.exe（NapCat）是 bot 的孙进程（bot → Popen node），
+        bot 退出不清理则 node 变孤儿进程残留。此方法幂等：未运行直接 OK。
+        """
+        if not self._alive():
+            return {"ok": True, "message": "未运行，无需停止"}
+        try:
+            self._proc.terminate()
+            self._proc.wait(timeout=8)
+        except Exception:
+            try:
+                self._proc.kill()
+            except Exception:
+                pass
+        self._proc = None
+        log.info(f"🛑 NapCat(win) 子进程已停止（bot 退出收尾）")
+        return {"ok": True, "message": "已停止"}
 
 
 # ============================================================
@@ -1155,3 +1299,24 @@ def logout() -> dict:
         with _logout_lock:
             _logout_state["active"] = False
             _logout_state["since"] = 0.0
+
+
+def stop() -> dict:
+    """停止 NapCat 进程（bot 退出收尾调用，2026-08-24 孤儿进程修复）。
+
+    仅 win 绿色版后端有效（node.exe 是 bot 子进程，bot 退出不清理会
+    残留成孤儿）；docker 容器是独立常驻进程（docker daemon 管理），
+    bot 退出不影响，不需要也不应该停；off 模式外部自管跳过。
+    """
+    mode, b = _backend()
+    if mode == "off" or b is None:
+        return {"ok": True, "message": "mode=off：外部自管，跳过"}
+    if not hasattr(b, "stop"):
+        return {"ok": True, "message": f"{mode} 后端无需显式停止"}
+    try:
+        r = b.stop()
+        log.info(f"🛑 NapCat({mode}) 已停止（bot 退出收尾）")
+        return r or {"ok": True, "message": "已停止"}
+    except Exception as e:
+        log.warning(f"⚠️ NapCat({mode}) stop 异常: {e}")
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}

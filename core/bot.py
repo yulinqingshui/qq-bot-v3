@@ -135,7 +135,7 @@ def _write_napcat_status(status: str, detail: str = "", account: str = ""):
                 f"打开 GUI 总览页 NapCat 卡片扫码（重启无效）；"
                 f"无扫码提示 = OneBot HTTP 服务半死，docker restart napcat",
             ]
-        with open(NAPCAT_STATUS_FILE, "w") as f:
+        with open(NAPCAT_STATUS_FILE, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
     except Exception:
         pass  # 状态文件写失败不影响主流程
@@ -495,6 +495,11 @@ def run_server():
             ping_interval=20,
             ping_timeout=20,
             max_size=2**20,  # 2MB
+            # 08-24 修复：默认 max_queue=16，NapCat 登录后瞬间批量推送
+            # （一次可达 20+ 条，含图片/语音/文本）在 bot 主账号判定完成
+            # （get_login_info 最长 8s）前积压，超过 16 条旧消息被队列
+            # 丢弃 → 启动瞬间图片/消息静默丢失不存档。调大缓冲防丢帧。
+            max_queue=1024,
         )
         logger.info(f"✅ WebSocket 服务已启动: ws://{host}:{port}")
 
@@ -570,6 +575,14 @@ def run_server():
             _cfg_sig, _cfg_applied = _maybe_reload_config_files(_cfg_sig)
 
         logger.info("🛑 正在停止服务...")
+        # 2026-08-24 孤儿进程修复：bot 退出必须清掉 NapCat 子进程
+        # （win 绿色版 node.exe 是 bot 的孙进程，不清会残留成孤儿；
+        # docker/off 模式 stop() 内部已是 no-op）
+        try:
+            from core import napcat_manager
+            napcat_manager.stop()
+        except Exception as e:
+            logger.warning(f"⚠️ 停止 NapCat 异常: {e}")
         server.close()
         await server.wait_closed()
         await control_api.stop_control_api()

@@ -309,6 +309,16 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if r == QMessageBox.No:
+                # 停止 bot：控制 API 优雅停 + 兜底杀（含 NapCat，bot 退出收尾清理）
                 self.pm.stop_bot(graceful_timeout=8)
-        self.pm.shutdown()
+                self.pm.shutdown(kill_bot=True)
+                event.accept()
+                return
+            # 保留运行：只停轮询线程，bot 进程留在后台（08-24 修复：
+            # 原来误杀 bot 且 NapCat 残留孤儿）
+            self.pm.shutdown(kill_bot=False)
+            event.accept()
+            return
+        # bot 不在运行：直接收尾
+        self.pm.shutdown(kill_bot=True)
         event.accept()

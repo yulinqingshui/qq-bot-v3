@@ -118,16 +118,28 @@ def _redact_config() -> dict:
 #  状态快照
 # ============================================================
 def _napcat_status_detail() -> dict:
-    """读取 data/napcat_status.txt（bot.py 写入的状态文件）。"""
+    """读取 data/napcat_status.txt（bot.py 写入的状态文件）。
+
+    08-24 编码修复：bot.py 写文件已强制 UTF-8；历史文件可能是
+    Windows 默认 GBK 写入的，UTF-8 解码失败时回退 GBK 读取。
+    """
     try:
         status_file = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "napcat_status.txt")
         if os.path.exists(status_file):
             data = {}
-            with open(status_file, encoding="utf-8") as f:
-                for line in f:
-                    if ":" in line:
-                        k, _, v = line.partition(":")
-                        data[k.strip()] = v.strip()
+            raw = open(status_file, "rb").read()
+            for enc in ("utf-8", "gbk"):
+                try:
+                    text = raw.decode(enc)
+                    break
+                except (UnicodeDecodeError, LookupError):
+                    continue
+            else:
+                text = raw.decode("utf-8", errors="replace")
+            for line in text.splitlines():
+                if ":" in line:
+                    k, _, v = line.partition(":")
+                    data[k.strip()] = v.strip()
             return data
     except Exception:
         pass

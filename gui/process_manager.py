@@ -228,9 +228,17 @@ class BotProcessManager(QThread):
                 break
             self.msleep(1500)
 
-    def shutdown(self):
-        """GUI 退出时调用：确保子进程被清理。"""
+    def shutdown(self, kill_bot: bool = True):
+        """GUI 退出时调用：停轮询线程；kill_bot=True 时兜底清理 bot 子进程。
+
+        2026-08-24 修复：原实现无条件 terminate bot——closeEvent 选
+        「保留运行」时 bot 也被杀（与文案矛盾）、NapCat 变孤儿残留。
+        现在 kill_bot=False 仅停轮询线程，bot 进程继续后台运行
+        （日志走 data/bot.log 文件，GUI 管道断写被 logging 吞掉）。
+        """
         self._stop_requested = True
+        if not kill_bot:
+            return
         if self.proc is not None and self.proc.poll() is None:
             try:
                 self.proc.terminate()
