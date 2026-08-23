@@ -202,14 +202,34 @@ async def archive_image(message_id: int, message_type: str, target_id: int,
                         "SELECT file_path, file_size FROM image_archive WHERE md5_hash = ? LIMIT 1",
                         (result_md5,),
                     ).fetchone()
-                    if dup and dup["file_path"] and os.path.exists(dup["file_path"]):
-                        file_path = dup["file_path"]
-                        file_size = dup["file_size"]
-                        md5_hash = result_md5
-                        try:
-                            os.remove(result_path)
-                        except OSError:
-                            pass
+                    # 08-24 修复：本地文件名=md5，重复图二次下载后 result_path
+                    # 与 dup 记录的 file_path（同群目录）必然同一路径。原逻辑
+                    # 在 os.path.exists 检查（看到的是自己刚下载的文件，必真）
+                    # 后执行 os.remove(result_path) —— 删掉了唯一的文件，DB 却
+                    # 记 status=ok → 图片"存档成功"但磁盘无文件（e9ab1b32 等
+                    # 幸存纯属 dup 命中 C 盘失效路径的偶然）。现在按路径关系统
+                    # 一处理：同路径复用不删；异路径且旧文件真实存在才删新保旧；
+                    # 旧路径失效（目录迁移/被删）则保留新文件。
+                    if dup and dup["file_path"]:
+                        if os.path.normcase(os.path.abspath(result_path)) == os.path.normcase(os.path.abspath(dup["file_path"])):
+                            # 同一路径：刚下载的就是去重目标文件，直接复用
+                            file_path = result_path
+                            file_size = result_size
+                            md5_hash = result_md5
+                        elif os.path.exists(dup["file_path"]):
+                            # 旧文件真实存在且路径不同：复用旧文件，删新保旧
+                            file_path = dup["file_path"]
+                            file_size = dup["file_size"]
+                            md5_hash = result_md5
+                            try:
+                                os.remove(result_path)
+                            except OSError:
+                                pass
+                        else:
+                            # 旧路径已失效（目录/文件被移动或删除）：保留新下载
+                            file_path = result_path
+                            file_size = result_size
+                            md5_hash = result_md5
                     else:
                         file_path = result_path
                         file_size = result_size
