@@ -189,6 +189,21 @@ class TabAiChat(QWidget):
         self._load_groups()
 
     # ------------------------------------------------------------
+    #  切页刷新（08-24：群列表只在初始化加载一次，聊天后切回页面
+    #  不刷新 → 新群/新对话不可见。与 tab_groups 的 showEvent 模式对齐）
+    # ------------------------------------------------------------
+    def showEvent(self, e):
+        # 记住当前浏览位（群/用户），刷新后按 id 恢复选中
+        prev_group = self._cur_group
+        prev_user = (self._cur_user or {}).get("user_id") if self._cur_user else None
+        # 刷新聊天内容缓存键——_load_chat 有 _chat_key 去重，
+        # 刷新后重新加载需要重置，否则同 key 直接 return
+        self._chat_key = None
+        self._load_groups(restore_group=prev_group,
+                          restore_user_id=prev_user)
+        super().showEvent(e)
+
+    # ------------------------------------------------------------
     #  构建
     # ------------------------------------------------------------
     def _build(self):
@@ -322,7 +337,8 @@ class TabAiChat(QWidget):
     # ------------------------------------------------------------
     #  数据加载
     # ------------------------------------------------------------
-    def _load_groups(self):
+    def _load_groups(self, restore_group: int | None = None,
+                     restore_user_id: int | None = None):
         """群列表：chat_messages 对话记忆单元（08-22 方案 A，原 user_personas）。
 
         语义=「和 bot 聊过天的群」：一开聊当天即上榜（原人设表要等每日 0 点
@@ -330,6 +346,9 @@ class TabAiChat(QWidget):
         过滤：群号>1e8（挡 111 类测试群号）+ message_archive≥10 行
         （挡 999999 等无真实存档的测试会话）。
         计数列=对话用户数（COUNT DISTINCT user_id）。
+
+        08-24：restore_group/restore_user_id —— showEvent 切页刷新时保持
+        当前选中（群列表在启动后不自动更新，聊天后切回页面需重载且不丢浏览位）。
         """
         def _do():
             return api_client.query(
@@ -351,8 +370,30 @@ class TabAiChat(QWidget):
             self._group_rows = rows
             self._fill_group_table()
             self.mw.statusBar().showMessage(f"AI 聊天：{len(rows)} 个群")
-            # 默认选中第一个群
-            if self._group_rows and self._cur_group is None:
+            if not rows:
+                self._cur_group = None
+                self._cur_user = None
+                self._clear_chat()
+                self.lbl_chat_state.setText("暂无聊天记录——在群里 @机器人 聊一句后回来自动出现")
+                return
+            if restore_group is not None:
+                # 切页刷新：恢复原选中群（列表可能有新群，索引会变 → 按群号找）
+                for i, r in enumerate(rows):
+                    if r["group_id"] == restore_group:
+                        self._cur_group = restore_group
+                        # setRowCount 不清 selectionModel，需先清选中再重选，
+                        # 否则 currentRow 残留旧索引、selectRow 不触发选中事件
+                        self.tbl_group.clearSelection()
+                        self.tbl_user.clearSelection()
+                        self._select_row(self.tbl_group, i)
+                        self._load_users(restore_user_id=restore_user_id)
+                        return
+                # 原群已不在列表（被过滤/清数据）→ 回落到第一个群
+                self._cur_group = None
+                self._cur_user = None
+                self._select_row(self.tbl_group, 0)
+                return
+            if self._cur_group is None:
                 self._select_row(self.tbl_group, 0)
 
         w.finished_ok.connect(_ok)
@@ -395,7 +436,7 @@ class TabAiChat(QWidget):
         self.lbl_chat_state.setText("先在左侧选一个用户")
         self._load_users()
 
-    def _load_users(self):
+    def _load_users(self, restore_user_id: int | None = None):
         gid = self._cur_group
 
         def _do():
@@ -446,7 +487,27 @@ class TabAiChat(QWidget):
             self._fill_user_table()
             self.mw.statusBar().showMessage(
                 f"群 {gid}：{len(rows)} 人")
-            if rows and self._cur_user is None:
+            if not rows:
+                self._cur_user = None
+                self._clear_chat()
+                self.lbl_chat_state.setText("暂无对话——在群里 @机器人 聊一句后回来自动出现")
+                return
+            if restore_user_id is not None:
+                # 切页刷新：恢复原选中用户（按 user_id 找，索引可能已变）
+                for i, r in enumerate(rows):
+                    if r["user_id"] == restore_user_id:
+                        self.tbl_user.clearSelection()
+                        self._cur_user = {**r, "_gid": self._cur_group}
+                        self._select_row(self.tbl_user, i)
+                        # _on_user_select 对相同用户会提前 return（去重），
+                        # 恢复浏览位后必须手动刷新聊天内容
+                        self._load_chat()
+                        return
+                # 原用户不在列表 → 落回第一个
+                self._cur_user = None
+                self._select_row(self.tbl_user, 0)
+                return
+            if self._cur_user is None:
                 self._select_row(self.tbl_user, 0)
 
         w.finished_ok.connect(_ok)
