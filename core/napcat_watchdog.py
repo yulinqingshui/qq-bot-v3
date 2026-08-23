@@ -180,6 +180,15 @@ async def awaiting_login_scan() -> bool:
     now = time.time()
     if now - _scan_cache[0] < 10:
         return _scan_cache[1]
+    # 08-23：win 绿色版后端无 docker，走本地日志 + 本地码文件双信号
+    from . import napcat_manager
+    if napcat_manager.resolve_mode() == "win":
+        hit, why = await _awaiting_scan_win()
+        _scan_cache = (now, hit)
+        _scan_why = why
+        if hit:
+            logger.debug(f"🐱 待扫码检测命中（win: {why}）")
+        return hit
     container = CONFIG.get("NAPCAT_CONTAINER") or "napcat"
     try:
         loop = asyncio.get_running_loop()
@@ -257,6 +266,52 @@ def _qrcode_fresh(container: str, max_age: int = 300) -> bool:
         return (time.time() - mtime) < max_age
     except Exception:
         return False
+
+
+async def _awaiting_scan_win() -> tuple[bool, str]:
+    """Win 绿色版后端的待扫码检测（2026-08-23，无 docker 版本）。
+
+    双信号 OR（与 docker 版语义对齐）：
+      1) 本地 napcat_win.log 尾部 6000 字符含 _SCAN_MARKERS
+         （node 子进程 stdout 全量重定向到此文件，与 docker logs 等价）
+      2) 本地数据目录内 qrcode.png mtime 新鲜（复用 napcat_manager
+         .status() 的 _find_qr 递归扫描，码文件位置随版本漂移也不怕）
+    两路都读不到 → True（保守放行，与 docker 版一致：宁可漏杀不可误杀，
+    且打 WARNING 留取证）；读到但无信号 → False。
+    """
+    from .config import CONFIG
+    from . import napcat_manager
+    # 信号 1：本地日志 marker
+    log_path = os.path.join(
+        CONFIG.get("NAPCAT_DATA_DIR") or "", "napcat_win.log")
+    logs_readable = False
+    marker_hit = False
+    try:
+        loop = asyncio.get_running_loop()
+        out = await loop.run_in_executor(
+            None, lambda: open(log_path, encoding="utf-8",
+                                errors="replace").read()[-6000:]
+            if os.path.isfile(log_path) else "")
+        logs_readable = bool(out)
+        marker_hit = logs_readable and any(m in out for m in _SCAN_MARKERS)
+    except Exception:
+        logs_readable = False
+        marker_hit = False
+    # 信号 2：本地码文件新鲜（_find_qr 只认 5 分钟内的码，等价 mtime 判定）
+    qr_fresh = False
+    try:
+        loop = asyncio.get_running_loop()
+        data_dir = CONFIG.get("NAPCAT_DATA_DIR") or ""
+        b64, mtime = await loop.run_in_executor(
+            None, lambda: napcat_manager._find_qr(data_dir))
+        qr_fresh = bool(b64 and mtime > 0)
+    except Exception:
+        qr_fresh = False
+    if marker_hit or qr_fresh:
+        return True, ("日志marker" if marker_hit else "码文件新鲜")
+    if not logs_readable and not qr_fresh:
+        return True, "检测失败(保守放行)"
+    return False, "无信号"
 
 
 # 启动宽限期（08-23：14:51 误杀时容器刚被手动刷新拉起 175s，QQ 栈 +

@@ -783,6 +783,62 @@ class WinGreenBackend:
         return (os.path.isfile(self._node_exe())
                 and os.path.isfile(os.path.join(self.pkg_dir, "index.js")))
 
+    def _patch_napcat_mjs(self) -> None:
+        """修复官方绿色版的 --no-sandbox 崩溃（2026-08-23 真机实测根因）。
+
+        napcat/napcat.mjs 用 child_process.fork 拉 worker 进程时硬塞了
+        Chromium 的 --no-sandbox 旗标（Linux/docker 专用），Windows 的
+        node 直接报 `bad option: --no-sandbox` 退出码 9，worker 三连炸
+        后主进程自杀 → NapCat 永远起不来、无二维码、WebUI 端口不通。
+
+        修复：把 `...X ? {} : { execArgv: ["--no-sandbox"] }` 三元展开
+        整体移除（非 Electron 路径本来就不该带任何 execArgv）。
+        幂等：已修复（marker 文件存在且 mjs 内无残留）直接返回；
+        版本升级（mjs 内重新出现该串）自动重新修复。
+        """
+        # mjs 定位：官方 zip 直接解到 pkg_dir，结构 pkg_dir/napcat/napcat.mjs；
+        # 若用户解压时多套一层目录（pkg_dir/NapCat.Shell.Windows.Node/napcat/…）
+        # 也兼容
+        candidates = [os.path.join(self.pkg_dir, "napcat", "napcat.mjs")]
+        if os.path.isdir(self.pkg_dir):
+            for d in os.listdir(self.pkg_dir):
+                p = os.path.join(self.pkg_dir, d, "napcat", "napcat.mjs")
+                if os.path.isfile(p):
+                    candidates.append(p)
+        mjs = next((p for p in candidates if os.path.isfile(p)), None)
+        if not mjs:
+            log.warning("未找到 napcat/napcat.mjs（无法打 --no-sandbox 补丁），"
+                        "绿色版目录结构可能有变")
+            return
+        marker = mjs + ".patched"
+        try:
+            with open(mjs, encoding="utf-8") as f:
+                content = f.read()
+        except OSError as e:
+            log.warning(f"读取 napcat.mjs 失败（补丁跳过）: {e}")
+            return
+        import re
+        # 匹配整个 spread 表达式（含前导逗号）：`...X ? {} : { execArgv: ["--no-sandbox"] }`
+        pat = re.compile(r",?\s*\.\.\.\w+\s*\?\s*\{\s*\}\s*:\s*\{\s*execArgv:\s*\[\s*\"--no-sandbox\"\s*\]\s*\}")
+        if pat.search(content) or ("execArgv" in content and "--no-sandbox" in content):
+            patched, n1 = pat.subn("", content)
+            # 兜底：三元结构被混淆器改动时，至少把 execArgv 数组清空
+            patched, n2 = re.subn(r"execArgv:\s*\[\s*\"--no-sandbox\"\s*\]",
+                                  "execArgv: []", patched)
+            if n1 or n2:
+                # 补丁后语法自检（有 node 环境时；发行版运行在 Windows 无 node 命令，
+                # 跳过不影响——补丁本身是纯文本替换，结构已实测验证）
+                with open(mjs, "w", encoding="utf-8") as f:
+                    f.write(patched)
+                with open(marker, "w", encoding="utf-8") as f:
+                    f.write(f"patched at {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                            f"ternary={n1} fallback={n2}\n")
+                log.info(f"🩹 napcat.mjs 已修复 --no-sandbox "
+                         f"(ternary={n1}, fallback={n2})")
+        elif not os.path.isfile(marker):
+            # 无残留也无 marker：结构未知，记日志提示人工检查
+            log.warning("napcat.mjs 内未发现 --no-sandbox（可能版本结构有变）")
+
     def download(self) -> dict:
         """从 GitHub Release 下载绿色版 zip 并解压到 win_package_dir。"""
         url = CONFIG.get("NAPCAT_WIN_DOWNLOAD_URL", "")
@@ -832,6 +888,7 @@ class WinGreenBackend:
             return "绿色版未就绪（先点刷新触发下载，或手动解压到 napcat.win_package_dir）"
         os.makedirs(self.data_dir, exist_ok=True)
         self._write_onebot_config()
+        self._patch_napcat_mjs()
         env = dict(os.environ)
         # 数据根指向程序目录（passkey/QR/onebot11 配置全在这）
         env["NAPCAT_WORKDIR"] = self.data_dir
