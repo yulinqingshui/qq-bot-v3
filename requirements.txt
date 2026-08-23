@@ -1,0 +1,16 @@
+# QQ Bot v3 — GUI 版
+# 运行依赖（Python 3.10+，当前验证于 3.14）
+# 安装: pip install -r requirements.txt
+
+# --- 核心运行时 ---
+websockets>=16.0          # OneBot 11 反向 WebSocket
+aiohttp>=3.9              # bot 内嵌控制 API（GUI 通道）
+httpx>=0.27               # LLM 异步调用
+requests>=2.31            # 同步 HTTP 兜底
+Pillow>=10.0              # 图片处理/压缩
+pypinyin>=0.51            # 敏感词替换为拼音
+PyYAML>=6.0               # config.yaml 解析
+jieba                     # 中文分词（部分模块依赖）
+
+# --- GUI（PySide6）---
+PySide6>=6.5              # 图形界面（总览/配置/消息管理/人设/群组/游戏/画图/日志 8 标签页）

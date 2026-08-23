@@ -1,0 +1,45 @@
+# 密钥（含 API key，绝不提交）
+.env
+*.env
+!.env.example
+
+# 虚拟环境
+.venv/
+
+# 运行数据（数据库/存档/日志/图片）——题库除外（随程序分发）
+data/*
+!data/question_bank/
+*.db
+*.db-shm
+*.db-wal
+*.log
+bot.log
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 测试缓存
+.pytest_cache/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+
+# NapCat 凭据（若本地有）
+napcat/config/passkey.json
+
+# Windows 样式副本
+* (副本)*
+* (副本 2)*
+
+# 备份
+*.bak
+
+# 扫码二维码（临时，含登录凭据）
+qr_*.png
+napcat_qrcode_*.png

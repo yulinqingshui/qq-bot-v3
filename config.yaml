@@ -1,0 +1,74 @@
+listen:
+  host: 0.0.0.0
+  port: 8696
+control_api:
+  host: 127.0.0.1
+  port: 8697
+bot:
+  qq: ''
+  max_history: 400
+  cooldown_seconds: 3
+  session_timeout: 259200
+  session_gap_seconds: 1800
+  auto_approve_friend: true
+  echo_repeat: true
+llm:
+  enabled: true
+  backend: remote
+  remote_api: ''
+  remote_model: ''
+  remote_max_tokens: 16384
+  remote_max_parallel: 10
+  local_api: ''
+  local_model: ''
+archive:
+  base_dir: data/archive
+  text_retention_days: 0
+  media_retention_days: 30
+  save_recall_messages: true
+  save_recall_images: true
+assets:
+  pun_dir: ''
+  sensitive_words: ''
+  cosplay_db: ''
+comfyui:
+  url: ''
+napcat:
+  mode: auto
+  container: napcat
+  ws_token: ''
+  console_port: 6099
+  onebot_http_port: 3000
+  config_dir: ''
+  watchdog_interval: 60
+  watchdog_threshold: 3
+  watchdog_auto_restart: false
+debug:
+  save_batch_text: false
+  batch_endpoint: false
+paths:
+  data_dir: data
+msg:
+  save_recall_messages: true
+  save_recall_images: true
+  receive_enabled: true
+  send_enabled: true
+  receive_scope: all
+  send_scope: all
+  receive_text: true
+  receive_image: true
+  receive_voice: true
+  receive_video: false
+  receive_file: false
+  receive_forward: true
+persona: {}
+analysis:
+  max_rows: 10000
+roleplay: {}
+scheduler:
+  mimic_enabled: true
+  mimic_probability: 3
+  daily_report: true
+  question_refill: true
+  persona_update: true
+qa: {}
