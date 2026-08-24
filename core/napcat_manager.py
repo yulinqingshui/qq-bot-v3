@@ -200,10 +200,15 @@ def _read_webui_token(backend: str) -> str:
     {hash: sha256(token + '.napcat').hexdigest()} → data.Credential（JWT），
     存 localStorage['token']。token 由 NapCat 首次启动自生成（webui.json）。
     带 5 分钟缓存（status() 被 GUI 2s 轮询，避免频繁 docker exec）。
+
+    08-24 修复：空值不写缓存——NapCat 刚重启、webui.json 尚未重写时
+    首次轮询会读到空，旧逻辑把空缓存 5 分钟，期间 GUI 打开控制台拿
+    不到 token（复制到剪贴板功能失效）。现在读到空仅当作本次结果，
+    下次轮询立刻重读。
     """
     global _WEBUI_TOKEN_CACHE
     now = time.time()
-    if now - _WEBUI_TOKEN_CACHE[0] < 300:
+    if now - _WEBUI_TOKEN_CACHE[0] < 300 and _WEBUI_TOKEN_CACHE[1]:
         return _WEBUI_TOKEN_CACHE[1]
     token = ""
     try:
@@ -224,7 +229,8 @@ def _read_webui_token(backend: str) -> str:
     except Exception as e:
         log.debug(f"读 webui token 失败: {e}")
         token = ""
-    _WEBUI_TOKEN_CACHE = (now, token)
+    if token:
+        _WEBUI_TOKEN_CACHE = (now, token)
     return token
 
 
@@ -309,8 +315,12 @@ def _build_status(running: bool, hint: str, qrcode_b64: str = "",
         "qrcode_mtime": qrcode_mtime,
         "hint": hint,
         "console_url": _console_url(),
-        # WebUI 登录 token（GUI 内嵌控制台时自动注入登录态；5 分钟缓存）
-        "webui_token": _read_webui_token(backend) if running else "",
+        # WebUI 登录 token（GUI 内嵌控制台时自动注入登录态；5 分钟缓存）。
+        # 08-24 修复：不再依赖 running——NapCat 进程活着但守护判定登录态
+        # 失效（等待扫码）时 running 仍为 True 但 webui.json 可能还没重写；
+        # 进程短暂未运行时 webui.json 文件也在，token 依然有效。文件在
+        # 就读，读不到才返回空（避免缓存空值已在上层修复）。
+        "webui_token": _read_webui_token(backend),
     }
     if ws_connected:
         info["hint"] = "QQ 已登录，NapCat 已连入 bot"
