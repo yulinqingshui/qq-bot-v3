@@ -45,6 +45,7 @@ import base64
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import threading
@@ -1001,6 +1002,38 @@ class WinGreenBackend:
                 log.warning(f"⚠️ 自愈 onebot11 配置失败 {f}: {e}")
 
     # ---- 进程管理 ----
+    def _detect_quick_uin(self) -> str:
+        """探测可快速登录的 QQ uin（2026-08-24：重启后免扫码）。
+
+        来源优先级：
+          1. onebot11_<uin>.json 账号配置文件名（NapCat 登录后自动生成）
+          2. data/napcat_status.txt 的 account 行（bot 连接后写入）
+        返回空串 = 无历史登录，走二维码流程（幂等：不影响首次部署）。
+        """
+        # 1) onebot11_<uin>.json 文件名推导
+        try:
+            cfg_dir = os.path.join(self.data_dir, "config")
+            if os.path.isdir(cfg_dir):
+                for f in sorted(os.listdir(cfg_dir)):
+                    m = re.match(r"onebot11_(\d+)\.json$", f)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+        # 2) napcat_status.txt account 行兜底
+        try:
+            sf = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "data", "napcat_status.txt")
+            if os.path.isfile(sf):
+                for line in open(sf, encoding="utf-8", errors="replace"):
+                    if line.startswith("account:"):
+                        m = re.search(r"\((\d+)\)", line)
+                        if m:
+                            return m.group(1)
+        except OSError:
+            pass
+        return ""
+
     def _spawn(self) -> str:
         if not self._green_ready():
             return "绿色版未就绪（先点刷新触发下载，或手动解压到 napcat.win_package_dir）"
@@ -1019,10 +1052,22 @@ class WinGreenBackend:
         env["NAPCAT_WORKDIR"] = self.data_dir
         # 与绿色版 index.js 自身设置一致（禁 pipe，避免跨进程通信问题）
         env.setdefault("NAPCAT_DISABLE_PIPE", "1")
+        # 08-24：重启后免扫码——探测上次登录账号并尝试快速登录
+        #  A. -q <uin> 命令行参数（napcat.mjs 82313 行解析，走 quickLoginWithUin）
+        #  B. NAPCAT_QUICK_ACCOUNT 环境变量（WebUI 自动快速登录第三条路，70077 行）
+        #  两者都设；探测不到 uin（首次部署）时保持原二维码流程，零影响。
+        quick_uin = self._detect_quick_uin()
+        cmd = [self._node_exe(), os.path.join(self.pkg_dir, "index.js")]
+        if quick_uin:
+            cmd += ["-q", quick_uin]
+            env["NAPCAT_QUICK_ACCOUNT"] = quick_uin
+            log.info(f"🔑 NapCat 快速登录探测: uin={quick_uin}（-q + NAPCAT_QUICK_ACCOUNT）")
+        else:
+            log.info("🔑 NapCat 未发现历史登录 uin，本次走二维码登录流程")
         try:
             logf = open(os.path.join(self.data_dir, "napcat_win.log"), "ab")
             self._proc = subprocess.Popen(
-                [self._node_exe(), os.path.join(self.pkg_dir, "index.js")],
+                cmd,
                 cwd=self.pkg_dir,
                 env=env,
                 stdout=logf, stderr=subprocess.STDOUT,
