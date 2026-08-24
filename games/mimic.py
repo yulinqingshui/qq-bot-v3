@@ -354,12 +354,27 @@ async def generate_mimic_reply(nickname: str, user_id: int, group_id: int,
     stance = _recent_user_stance(user_id, group_id)
 
     prompt = _build_prompt(nickname, msgs, persona_text, group_msgs, stance, question)
-    reply = await _call_llm_net(
-        prompt, max_tokens=8192, temperature=0.85, priority=priority, timeout=300,
-        json_mode=True, reasoning_effort="max",
-        # 2026-08-13：json_mode+8192 组合实测 0 泄漏后，thinking 恢复 max
-        # （深度分析风格/语境提升模仿质量；泄漏由 json_mode 强制 JSON 兜底）
-    )
+    # 2026-08-24：LLM 参数跟随 AI 聊天链路（与 _handle_ai_reply 同源：
+    # CONFIG["AI_CHAT_CFG"]["llm"]，GUI「AI 聊天·显示参数」弹窗可配、热重载即时生效）。
+    # 原硬编码 max_tokens=8192/temperature=0.85/thinking=max 被本地后端 Jinja 模板
+    # 拒绝（Qwen3 系模板只接受 none/low/medium/high，max → HTTP 500
+    # "Unexpected reasoning effort max" → 赛博模仿整链路报"模型出了点小问题"）。
+    from core.config import CONFIG as _CFG
+    _ai_llm = ((_CFG.get("AI_CHAT_CFG") or {}).get("llm") or {})
+    _kw = {
+        "max_tokens": int(_ai_llm.get("max_tokens", 65536)),
+        "temperature": float(_ai_llm.get("temperature", 0.7)),
+        "json_mode": bool(_ai_llm.get("json_mode", False)),
+        "timeout": int(_ai_llm.get("timeout", 1800)),
+        "priority": priority,
+    }
+    _th = str(_ai_llm.get("thinking", "on")).lower()
+    if _th == "off":
+        _kw["disable_thinking"] = True
+    elif _th in ("low", "max"):
+        _kw["reasoning_effort"] = _th
+    # _th == "on" → 不传（后端默认思考）
+    reply = await _call_llm_net(prompt, **_kw)
     text = (reply or "").strip()
     # JSON 解析（json_mode 输出 {"reply": "..."}）
     try:

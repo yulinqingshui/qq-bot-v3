@@ -643,6 +643,14 @@ async def _post_llm_chat(
     # DeepSeek 系后端识别：URL 或模型名含 deepseek 均视为 DeepSeek 系
     # （部分 OpenAI 兼容网关 URL 不含 deepseek，需靠模型名兜底）。
     is_deepseek_backend = "deepseek" in api_url.lower() or "deepseek" in model.lower()
+    # 2026-08-24 后端方言兼容：本地 LLM（LM Studio + Qwen3 系模型）的 Jinja
+    # 模板只接受 none/low/medium/high——收到 "max" 直接 500
+    # （"Unexpected reasoning effort max"，赛博模仿硬编码 max 整链路报
+    # "模型出了点小问题"的根因）。DeepSeek 系保留 max；非 DeepSeek 后端
+    # 自动降 max→high（Qwen3 模板支持的最高档，语义等价"最深思考"）。
+    if (reasoning_effort and not is_deepseek_backend
+            and str(reasoning_effort).lower() == "max"):
+        reasoning_effort = "high"
     if disable_thinking and is_deepseek_backend:
         # 批量 JSON 提取任务显式关闭思考：更快（~4s vs 71s）、更省（~70 vs 8000 tokens）、
         # content 稳定输出。仅 DeepSeek 后端传 thinking 参数，本地 Ollama 不传避免 400。
