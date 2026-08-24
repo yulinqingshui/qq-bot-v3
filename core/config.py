@@ -52,6 +52,10 @@ DEFAULTS = {
         "auto_approve_friend": True,
         # 复读+1 全局开关（GUI 其他设置弹窗可关，08-23）
         "echo_repeat": True,
+        # 群聊引用消息是否触发 AI 聊天（GUI 其他设置弹窗，08-24）：
+        # 默认关=引用消息不回复（QQ 手机端引用自带 @，用户引用 bot 消息
+        # 一般不希望被回复）；开=引用消息与 @bot 消息同等待遇
+        "reply_to_quotes": False,
     },
     "llm": {
         # 总开关：false 时所有 LLM 调用直接降级（不调模型、不耗额度），
@@ -621,6 +625,7 @@ def _flatten_yaml(cfg: dict) -> dict:
         # 好友申请自动通过 / 复读+1 全局开关（08-23，GUI 其他设置弹窗管理）
         "BOT_AUTO_APPROVE_FRIEND": bool(cfg["bot"].get("auto_approve_friend", True)),
         "BOT_ECHO_REPEAT": bool(cfg["bot"].get("echo_repeat", True)),
+        "BOT_REPLY_TO_QUOTES": bool(cfg["bot"].get("reply_to_quotes", False)),
         # --- 数据库（不迁库：全部指向程序目录下新库）---
         "DB_PATH": os.path.join(data_dir, "chat_history.db"),
         "BOT_SETTINGS_DB_PATH": os.path.join(data_dir, "bot_settings.db"),

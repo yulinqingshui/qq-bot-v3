@@ -11,7 +11,8 @@ config_settings_dialogs.py — 配置设置弹窗（原「⚙️ 配置」标签
 - 保存链路（与原配置页一致）：写 yaml → POST /config 热重载 → 报告热生效/需重启
   （需重启项弹确认，确认后走总览页 _restart）
 - _collect 写 listen / control_api / assets / debug / paths 五段
-  + bot 段 2 个行为开关（auto_approve_friend / echo_repeat，08-23）；
+  + bot 段 3 个行为开关（auto_approve_friend / echo_repeat / reply_to_quotes，
+  08-23/08-24）；
   其余键（bot.qq/max_history 等、llm/comfyui/scheduler/msg）保持
   deepcopy 原值不动——其他页/弹窗管理的键不得被本弹窗覆盖（Pitfall 13）
 """
@@ -80,13 +81,15 @@ class ConfigSettingsDialog(QDialog):
 
     def _build_left(self) -> QGroupBox:
         """左列：进程与端口（5 项）——监听 2 + 控制 API 2 + 数据目录 1
-        + 机器人行为（2 项，08-23：好友申请自动通过 / 复读+1 全局开关）。
+        + 机器人行为（3 项，08-23：好友申请自动通过 / 复读+1 全局开关；
+        08-24：回复引用消息开关）。
 
         08-22：NapCat 守护 3 项原计划放本列，实测左列 4 组框 vs 右列 2 组框
         重心失衡（~250px），移至右列后两列 3 组框、内容高度差 ~20px。
         08-23：机器人行为 2 项加回左列（4 组框 7 项 vs 右列 3 组框 8 项，均衡）。
+        08-24：回复引用消息入列（4 组框 8 项 vs 右列 3 组框 8 项，项数持平）。
         """
-        gb = QGroupBox("进程与端口 / 机器人行为（7 项）")
+        gb = QGroupBox("进程与端口 / 机器人行为（8 项）")
         lay = QVBoxLayout(gb)
         lay.setSpacing(10)
 
@@ -119,7 +122,8 @@ class ConfigSettingsDialog(QDialog):
         lay.addWidget(gb_paths)
 
         # 机器人行为（08-23）：好友申请自动通过 + 复读+1 全局开关（保存即热生效）
-        gb_bot = QGroupBox("机器人行为（2 项 · 保存即热生效）")
+        # 08-24：+ 回复引用消息开关（默认关，保持现状：群聊引用消息不触发 AI 聊天）
+        gb_bot = QGroupBox("机器人行为（3 项 · 保存即热生效）")
         f = QFormLayout(gb_bot)
         self.cb_auto_approve_friend = QCheckBox()
         self.cb_auto_approve_friend.setChecked(True)
@@ -133,6 +137,14 @@ class ConfigSettingsDialog(QDialog):
             "开（默认）=群内连续 3 条相同纯文本时 bot 跟一条（模拟 +1）。\n"
             "关=完全不触发复读跟发。")
         f.addRow("复读 +1", self.cb_echo_repeat)
+        self.cb_reply_to_quotes = QCheckBox()
+        self.cb_reply_to_quotes.setChecked(False)
+        self.cb_reply_to_quotes.setToolTip(
+            "QQ 手机端引用消息会自动附带 @bot，但用户引用 bot 消息\n"
+            "一般不希望被回复 → 默认关=引用消息不触发 AI 聊天；\n"
+            "开=引用消息与 @bot 消息同等待遇（会回复）。\n"
+            "引用+命令/游戏指令（如引用消息里发 /投票）不受本开关影响。")
+        f.addRow("回复引用消息", self.cb_reply_to_quotes)
         lay.addWidget(gb_bot)
 
         lay.addStretch(1)
@@ -225,6 +237,9 @@ class ConfigSettingsDialog(QDialog):
             bool(bt.get("auto_approve_friend", True)))
         self.cb_echo_repeat.setChecked(
             bool(bt.get("echo_repeat", True)))
+        # 回复引用消息（08-24）：yaml 无键时默认关（保持现状：引用不触发 AI 聊天）
+        self.cb_reply_to_quotes.setChecked(
+            bool(bt.get("reply_to_quotes", False)))
         # NapCat 守护（08-22）：yaml 无键时回 DEFAULTS（60/3/关）
         nc = y.get("napcat", {})
         self.ed_wd_interval.setValue(int(nc.get("watchdog_interval", 60)))
@@ -250,6 +265,7 @@ class ConfigSettingsDialog(QDialog):
         bt = y.setdefault("bot", {})
         bt["auto_approve_friend"] = self.cb_auto_approve_friend.isChecked()
         bt["echo_repeat"] = self.cb_echo_repeat.isChecked()
+        bt["reply_to_quotes"] = self.cb_reply_to_quotes.isChecked()
         # NapCat 守护（08-22 半死态复盘）：写 napcat 段 3 键（热生效）。
         # 其余 napcat 键（mode/container/ws_token 等）保持 deepcopy 原值不动
         nc = y.setdefault("napcat", {})

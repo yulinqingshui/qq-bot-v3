@@ -4987,10 +4987,13 @@ async def handle_message(websocket, msg: dict):
         return
 
     # ---- AI 对话（后台执行，不阻塞 / 指令）----
-    # 群聊中，如果消息是引用回复（reply_id 存在），则跳过 AI 对话
-    # 避免用户引用 Bot 消息时因自动携带 @ 而误触发回复
-    if message_type == "group" and reply_id is not None:
-        logger.info(f"📎 群聊引用回复，跳过 AI 对话: {nickname}({user_id}) 引用了消息 #{reply_id}")
+    # 群聊引用消息是否进 AI 对话（GUI「其他设置→机器人行为」开关，08-24）：
+    # QQ 手机端引用消息会自动附带 @bot，但用户引用 bot 消息一般不希望被回复
+    # → 默认（关）跳过引用消息；开=引用消息与 @bot 消息同等待遇。
+    # 作用域仅 AI 对话兜底：引用+命令/游戏链路（3483 行 is_at 分支）不受影响
+    if (message_type == "group" and reply_id is not None
+            and not CONFIG.get("BOT_REPLY_TO_QUOTES", False)):
+        logger.info(f"📎 群聊引用回复，跳过 AI 对话（开关未开）: {nickname}({user_id}) 引用了消息 #{reply_id}")
         return
 
     save_message(session_key, "user", clean_text, user_id, nickname)
