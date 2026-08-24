@@ -1826,11 +1826,34 @@ class TabOverview(QWidget):
                 self.lbl_nc_state.setStyleSheet(_WARN_COLOR)
                 self.lbl_nc_state.setText("⚠️ 登录态失效 · 待扫码（点右侧刷新二维码 → 手Q 扫）")
         else:
-            # 已连接：状态行 + 账号信息区（昵称/QQ号/连接信息/版本）
-            self.lbl_nc_state.setStyleSheet(_OK_COLOR)
-            self.lbl_nc_state.setText("✅ 已登录并连接")
-            self._refresh_napcat_login_view(nap)
-            self._show_qr_area(False)
+            # 2026-08-24：QQ 已离线（WS 通道还连着但登录态失效/被踢）——
+            # 状态文件停在 connected 的假在线修复：nap.qq_online 来自
+            # /status 内存缓存（bot_offline 事件 + get_status 探测维护），
+            # 缺字段（旧 bot）默认在线不误报。橙色告警 + 分两种引导：
+            # 待扫码中 → 直接扫；未出码 → 点刷新二维码（08-24 起 QQ 离线
+            # 时该按钮走 force 重启出新码）。
+            if not nap.get("qq_online", True):
+                # scan_pending 缺省（旧 bot 无字段）= 未知，按「未出码」引导
+                if nap.get("scan_pending"):
+                    self.lbl_nc_state.setStyleSheet(_WARN_COLOR)
+                    self.lbl_nc_state.setText("⚠️ QQ 已离线 · 待扫码（手Q 扫下方二维码）")
+                    # 有码可扫：拉二维码显示 + 收起账号信息区（陈旧账号防误导）
+                    if time.time() - self._last_napcat_fetch > 10:
+                        self._fetch_napcat()
+                    self._show_qr_area(True)
+                    self._refresh_napcat_login_view(nap)
+                else:
+                    self.lbl_nc_state.setStyleSheet(_WARN_COLOR)
+                    self.lbl_nc_state.setText(
+                        "⚠️ QQ 已离线 · 收不到消息（点右侧「刷新二维码」重启出新码 → 手Q 扫）")
+                    self._show_qr_area(False)
+                    self._refresh_napcat_login_view(nap)
+            else:
+                # 已连接：状态行 + 账号信息区（昵称/QQ号/连接信息/版本）
+                self.lbl_nc_state.setStyleSheet(_OK_COLOR)
+                self.lbl_nc_state.setText("✅ 已登录并连接")
+                self._refresh_napcat_login_view(nap)
+                self._show_qr_area(False)
         # 注销完成（/status 字段回落 False）：恢复按钮可用性
         # （Worker 回调也会恢复，此处兜底进程重启/回调丢失的场景）
         if not logout_busy and not self._logout_busy \
@@ -2090,8 +2113,15 @@ class TabOverview(QWidget):
         self.mw._track(w)
 
     def _refresh_qr(self):
-        """点「刷新二维码」：已登录→仅重拉；未登录→重启 NapCat 出新码。"""
-        if self._last_status and self._last_status.get("napcat", {}).get("connected"):
+        """点「刷新二维码」：QQ 在线→仅重拉；QQ 离线/未连接→重启出新码。
+
+        2026-08-24：原判定用 napcat.connected（WS 通道）——QQ 离线时 WS
+        还连着，按钮被误路由到「重拉」，拿不到新码（08-24 假 connected
+        事故中用户只能手动杀 NapCat 进程）。改判 qq_online：离线时走
+        重启路径（服务端 _h_napcat_restart 也据此 force=True 绕过守卫）。
+        """
+        nap_st = (self._last_status or {}).get("napcat", {})
+        if nap_st.get("connected") and nap_st.get("qq_online", True):
             self._fetch_napcat(force=True)
             return
         self.btn_qr_refresh.setEnabled(False)

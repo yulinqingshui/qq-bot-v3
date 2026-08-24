@@ -109,12 +109,21 @@ def _write_napcat_status(status: str, detail: str = "", account: str = ""):
     """写 NapCat 连接状态到状态文件（用户/监控脚本可随时读取）。
 
     account: 已登录时的账号标识（"昵称 (QQ号)"），供 GUI 总览页显示。
+
+    2026-08-24：新增 qq_online 字段（QQ 真实在线状态，与 status 解耦）。
+    status 只反映 WS 连接（原语义不动，外部监控脚本兼容）；qq_online
+    反映 QQ 登录态（bot_offline 事件 / get_status 探测维护，见
+    napcat_watchdog.qq_online_state）。假 connected 修复：WS 连着但
+    QQ 被踢时，status=connected 但 qq_online=false，GUI 据此告警。
     """
     try:
+        from core import napcat_watchdog as _nw
+        qq_online = _nw.qq_online_state() if status == "connected" else False
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
         if status == "connected":
             lines = [
                 "status: connected",
+                f"qq_online: {'true' if qq_online else 'false'}",
                 f"time: {now_str}",
                 f"detail: {detail or 'NapCat 已连接，bot 正常运行'}",
             ]
@@ -361,6 +370,10 @@ async def _confirm_account(websocket, remote_addr: str, max_attempts: int = 5,
                 except Exception as e:
                     logger.warning(
                         f"⚠️ config bot.qq 自动同步失败（运行时仍以 {uin} 为准）: {e}")
+            # 08-24：QQ 在线状态恢复（WS 重连/新连接账号确认成功 =
+            # QQ 真实在线的权威信号，覆盖此前 bot_offline 置的离线）
+            from core import napcat_watchdog as _nw
+            _nw.mark_qq_online()
             _write_napcat_status("connected", f"remote={remote_addr}", account=account)
             return
         await asyncio.sleep(interval)

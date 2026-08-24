@@ -208,6 +208,7 @@ def get_status() -> dict:
     from .sender import _active_websocket, get_bot_uin
     from .llm import _resolve_llm_backend
     from . import napcat_manager
+    from . import napcat_watchdog  # 08-24：QQ 在线缓存（同步读，不阻塞）
 
     api_url, model, headers, cap = _resolve_llm_backend(CONFIG)
 
@@ -227,6 +228,11 @@ def get_status() -> dict:
         "napcat": {
             "connected": _active_websocket is not None,
             **_napcat_status_detail(),
+            # 08-24：QQ 真实在线状态（内存缓存优先于状态文件快照——
+            # watchdog 探测/事件更新的是内存，状态文件只在连接事件时重写）。
+            # 旧版 bot 无此字段时 GUI 默认在线（不误报）。假 connected 修复：
+            # WS 连着但 QQ 离线（登录态失效/被踢）时此字段=false，GUI 据此告警。
+            "qq_online": napcat_watchdog.qq_online_state(),
             # 版本信息（napcat_manager 内 1 小时缓存，GUI 版本行用）
             **napcat_manager.version_info(),
             # 注销进行中（08-23 竞态修复：GUI 禁用刷新/注销按钮，
@@ -346,9 +352,16 @@ async def _h_napcat(request):
 
 
 async def _h_napcat_restart(request):
-    """重启 NapCat 刷新二维码（仅未登录时允许，避免打断扫码/token 写入）。"""
+    """重启 NapCat 刷新二维码（仅未登录时允许，避免打断扫码/token 写入）。
+
+    2026-08-24：QQ 已离线（WS 连着但登录态失效）时 force=True 绕过
+    「已连接无需刷新」守卫——原守卫在这个场景把唯一出口堵死（watchdog
+    的 ws_ok 判定也跳过自动重启）→ 只能等人工手动杀进程。
+    """
     from . import napcat_manager
-    r = napcat_manager.restart()
+    from . import napcat_watchdog
+    force = not napcat_watchdog.qq_online_state()
+    r = napcat_manager.restart(force=force)
     if r.get("ok"):
         _get_logger().info(f"🔄 控制API: {r.get('message', '')}，约 10 秒后可拉取新码")
     return web.json_response(r)
@@ -411,8 +424,11 @@ async def _h_status(request):
     data = get_status()
     # 2026-08-23：待扫码状态（QQ 登录态失效挂二维码）——未连接时才检测
     # （10 秒缓存，GUI 2s 轮询不打爆 docker logs subprocess）
+    # 2026-08-24：条件放宽到「未连接 或 QQ 离线」——假 connected 场景
+    # （WS 连着但登录态失效）下 connected=True 会跳过检测，GUI 离线
+    # 分支读不到 scan_pending，无法区分「待扫码」与「未出码」两种引导
     nap = data.get("napcat") or {}
-    if not nap.get("connected"):
+    if not nap.get("connected") or not nap.get("qq_online", True):
         try:
             from . import napcat_watchdog
             nap["scan_pending"] = await napcat_watchdog.awaiting_login_scan()

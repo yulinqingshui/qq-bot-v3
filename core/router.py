@@ -3119,6 +3119,32 @@ async def handle_message(websocket, msg: dict):
         notice_type = msg.get("notice_type", "")
         # 临时调试日志（定位拍一拍不触发问题，定位后移除）
         logger.info(f"📡 notice 事件: type={notice_type}, raw={json.dumps(msg, ensure_ascii=False)[:300]}")
+
+        # bot_offline（2026-08-24：QQ 登录态失效的权威信号）：
+        # NapCat 进程活着、WS 不断、get_login_info 恒 200（陈旧数据），
+        # 但 QQ 已下线（被踢/风控）→ bot 静默收不到消息。此前只走上面的
+        # 通用日志，状态文件停在 connected、GUI 卡片恒绿（08-24 假 connected
+        # 事故根因）。现在 0 延迟置离线 + ERROR + 限频告警 + 状态文件落盘。
+        # 延迟 import：router 在 bot.py:175 被顶层 import，反向顶层 import
+        # bot/napcat_watchdog 会在独立入口（先 import router 的测试/脚本）
+        # 触发 partially initialized module（同 sender.py:317 惯例）。
+        if notice_type == "bot_offline":
+            detail = msg.get("message") or "登录已失效"
+            logger.error(f"🚨 QQ 已离线（bot_offline）: {detail}")
+            try:
+                from . import napcat_watchdog as _nw
+                # 先同步置离线（create_task 是异步的，告警 task 跑在
+                # 状态文件写入之后会读到旧缓存 → 文件误写 qq_online: true）
+                _nw.set_qq_online_state(False)
+                asyncio.create_task(_nw.mark_qq_offline(detail))
+                # 状态文件落 qq_online=false（GUI 卡片 + 外部监控脚本可见）
+                from . import bot as _bot
+                _bot._write_napcat_status("connected", "QQ 已离线（bot_offline）")
+            except Exception as _e:
+                logger.error(f"bot_offline 状态更新失败: {_e}", exc_info=True)
+            return
+        
+        
         # 入群/退群通知（2026-08-10）：群开关 enable_member_notify 开启时私聊通知管理员
         if notice_type in ("group_increase", "group_decrease"):
             await _handle_member_change_notify(websocket, msg, notice_type)

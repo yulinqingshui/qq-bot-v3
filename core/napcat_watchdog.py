@@ -78,6 +78,89 @@ async def check_http_healthy() -> tuple[bool, str]:
         return False, f"{type(e).__name__}: {str(e)[:80]}"
 
 
+# ============================================================
+#  QQ 在线状态（08-24：bot_offline 假 connected 修复）
+#
+#  08-24 故障复盘：NapCat 进程活着、WS 通道不断、/get_login_info
+#  恒 200（返回陈旧账号数据），但 QQ 登录态实际已失效（被踢/风控）
+#  ——状态文件停在 connected，GUI 卡片恒绿，bot 静默收不到消息 30+ 分钟。
+#  真实在线状态必须以 OneBot get_status 的 online 字段为准。
+#
+#  维护方式（bot 主事件循环内）：
+#    - router 收到 notice=bot_offline → mark_qq_offline()（0 延迟）
+#    - bot.py 连接账号确认成功 → mark_qq_online()（WS 重连恢复路径）
+#    - watchdog 每 tick 探测兜底（覆盖事件丢失/WS 未重连场景）
+#  get_status() 是同步函数（GUI 轮询线程调用），读的是下面这个
+#  模块级缓存，绝不同步等网络。
+# ============================================================
+_qq_online_cache = (0.0, True)  # (检测时刻, 状态) 10 秒缓存
+
+
+def mark_qq_online():
+    """连接账号确认成功（WS 重连后 get_login_info 拿到真实账号）：置在线。"""
+    global _qq_online_cache
+    _qq_online_cache = (time.time(), True)
+    logger.info("🐱 QQ 在线状态 → 在线（连接账号确认成功）")
+
+
+async def check_qq_online() -> bool:
+    """探测 QQ 是否真实在线（OneBot get_status.online）。
+
+    通道优先级：WS 反向（不依赖 HTTP 通道配置，最可靠）→ HTTP 兜底。
+    10 秒缓存（GUI /status 2s 轮询 + watchdog 共用，不重复探测）。
+
+    保守原则：探测通道本身不可用时返回 True（不误报离线）——
+    08-22 半死态（HTTP 挂）由 watchdog 的 HTTP 告警线负责，
+    本函数只负责「通道都活着但 QQ 离线」这个新盲区（08-24 实例）。
+    """
+    global _qq_online_cache
+    now = time.time()
+    if now - _qq_online_cache[0] < 10:
+        return _qq_online_cache[1]
+    from . import sender
+    online = None
+    if sender.ws_connected():
+        try:
+            resp = await sender.request_action("get_status", timeout=8)
+            if resp.get("status") == "ok":
+                data = resp.get("data") or {}
+                if "online" in data:
+                    online = bool(data["online"])
+        except Exception as e:
+            logger.debug(f"WS 反向 get_status 探测失败: {e}")
+    if online is None:
+        # HTTP 兜底（与 check_http_healthy 同源地址）
+        try:
+            import httpx
+            from .config import CONFIG
+            napcat_http = CONFIG.get("NAPCAT_HTTP") or \
+                f"http://127.0.0.1:{int(CONFIG.get('NAPCAT_ONEBOT_HTTP_PORT', 3000))}"
+            async with httpx.AsyncClient(timeout=8) as client:
+                resp = await client.get(f"{napcat_http}/get_status")
+            if resp.status_code == 200:
+                data = (resp.json().get("data") or {})
+                if "online" in data:
+                    online = bool(data["online"])
+        except Exception as e:
+            logger.debug(f"HTTP get_status 探测失败: {e}")
+    if online is None:
+        _qq_online_cache = (now, True)  # 探测不到 ≠ 离线（保守）
+        return True
+    _qq_online_cache = (now, online)
+    return online
+
+
+def qq_online_state() -> bool:
+    """同步读 QQ 在线缓存（get_status 同步函数 / GUI 轮询线程用）。"""
+    return _qq_online_cache[1]
+
+
+def set_qq_online_state(online: bool):
+    """直接置缓存（WS 断开等本地事实，不发探测）。"""
+    global _qq_online_cache
+    _qq_online_cache = (time.time(), bool(online))
+
+
 async def ws_healthy(timeout: float = 10.0) -> bool:
     """WS 反向 get_login_info 探活（08-23）。
 
@@ -314,6 +397,74 @@ async def _awaiting_scan_win() -> tuple[bool, str]:
     return False, "无信号"
 
 
+# ============================================================
+#  QQ 离线告警（08-24：事件驱动的主动告警，不等 watchdog tick）
+# ============================================================
+_QQ_OFFLINE_ALERT_GAP = 300  # 持续离线时告警间隔（秒）
+_last_offline_alert_at = 0.0
+
+
+async def mark_qq_offline(detail: str = ""):
+    """bot_offline 事件到达（router 调用）：置离线 + 限频告警。
+
+    事件是 0 延迟的权威信号，不等 watchdog 下一个 tick。
+    """
+    _set_qq_offline(detail)
+    await _alert_qq_offline(detail)
+
+
+def _set_qq_offline(detail: str = ""):
+    """只置离线状态（不告警）。"""
+    global _qq_online_cache
+    _qq_online_cache = (time.time(), False)
+    if detail:
+        logger.info(f"🐱 QQ 在线状态 → 离线（{detail}）")
+
+
+async def _alert_qq_offline(detail: str = ""):
+    """QQ 离线告警（事件/探测双路径共用，300s 限频）。
+
+    分两种引导：待扫码中 → 扫码；未出码 → 点「刷新二维码」
+    （win 版 = 重启 NapCat 进程出新码，08-24 实测有效）。
+    """
+    global _last_offline_alert_at
+    now = time.time()
+    if now - _last_offline_alert_at < _QQ_OFFLINE_ALERT_GAP:
+        return
+    _last_offline_alert_at = now
+    scan_pending = False
+    try:
+        scan_pending = await awaiting_login_scan()
+    except Exception:
+        pass
+    if scan_pending:
+        logger.warning(
+            f"🚨 QQ 已离线（{detail or 'bot_offline 事件'}）——正在等待扫码，"
+            f"打开 GUI 总览页 NapCat 卡片「刷新二维码」→ 手Q 扫码")
+    else:
+        logger.warning(
+            f"🚨 QQ 已离线（{detail or 'bot_offline 事件'}）——登录态失效，"
+            f"bot 收不到消息。处理: GUI 总览页 NapCat 卡片点「刷新二维码」"
+            f"（重启出新码）→ 手Q 扫码")
+
+
+async def _alert_qq_offline_from_probe(detail: str = ""):
+    """watchdog 探测发现离线（WS 连着 + get_status online=false）：置状态 + 告警。
+
+    2026-08-24（review 优化）：与 bot_offline 事件路径保持一致——置离线
+    同时落盘状态文件（qq_online=false）。此前探测路径只更新内存缓存，
+    外部监控脚本读状态文件会看到陈旧的 qq_online: true（GUI 读 /status
+    内存缓存不受影响，此优化针对外部读状态文件的场景）。
+    """
+    _set_qq_offline(detail)
+    try:
+        from . import bot as _bot
+        _bot._write_napcat_status("connected", f"QQ 已离线（{detail or 'watchdog 探测'}）")
+    except Exception as e:
+        logger.error(f"探测离线状态文件落盘失败: {e}", exc_info=True)
+    await _alert_qq_offline(detail)
+
+
 # 启动宽限期（08-23：14:51 误杀时容器刚被手动刷新拉起 175s，QQ 栈 +
 # HTTP 服务还在启动中，探活失败被累计成"挂死"）。刚重启的容器（无论
 # 谁发起的）在此窗口内探活失败不累计、fail_streak 清零——启动失败
@@ -411,6 +562,20 @@ async def watchdog_loop() -> None:
     fail_streak = 0
     while True:
         await asyncio.sleep(interval)
+        # 08-24 QQ 在线探测（bot_offline 假 connected 修复）：
+        # WS 通道活着但 get_status online=false = QQ 真实离线（登录态失效、
+        # 被踢、风控）——bot 收不到消息但状态文件/卡片仍显示 connected。
+        # bot_offline 事件路径 0 延迟处理，这里是 60s 粒度兜底（覆盖
+        # 事件丢失/未到达场景）。WS 断开时不探（进程都没了，状态由
+        # bot.py 的 disconnected 链路负责）。
+        try:
+            from . import sender as _sender
+            if _sender.ws_connected():
+                if not await check_qq_online():
+                    await _alert_qq_offline_from_probe(
+                        "watchdog 探测 get_status online=false")
+        except Exception as e:
+            logger.debug(f"QQ 在线探测异常（不影响 HTTP 守护）: {e}")
         healthy, detail = await check_http_healthy()
         if healthy:
             if fail_streak > 0:
