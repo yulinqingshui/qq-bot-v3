@@ -224,7 +224,10 @@ def parse_array_message(message_segments: list[dict], bot_qq: str) -> tuple[bool
                 text_parts.append(text)
         elif seg_type == "reply":
             rid = data.get("id")
-            if rid:
+            # 2026-08-24 弱引用兼容（NapCat 查不到被引用对象时上报 id=0 弱引用）：
+            # if rid: 会把 "0" 当 falsy 过滤 → reply_id=None → 引用跳过逻辑失效。
+            # 改用 is not None：id="0" 也计入（int("0")=0），None/非法值保持 None。
+            if rid is not None:
                 try:
                     reply_id = int(rid)
                 except ValueError:

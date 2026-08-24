@@ -909,6 +909,86 @@ class WinGreenBackend:
         elif not os.path.isfile(marker):
             # 无残留也无 marker：结构未知，记日志提示人工检查
             log.warning("napcat.mjs 内未发现 --no-sandbox（可能版本结构有变）")
+        # 补丁②（2026-08-24）：引用消息弱引用兜底。与上面幂等补丁同机制，
+        # 独立方法（锚点/特征子串自检，与 --no-sandbox 补丁互不干扰）。
+        if mjs and os.path.isfile(mjs):
+            try:
+                self._patch_napcat_quote_weak(mjs, marker)
+            except Exception as e:
+                log.warning(f"引用弱引用补丁异常（不阻断启动）: {e}")
+
+    def _patch_napcat_quote_weak(self, mjs: str, marker: str) -> None:
+        """（补丁②）引用消息弱引用兜底（2026-08-24 真机问题修复）。
+
+        NapCat（win 绿色版 v4.18.19 实测）收到引用消息但查不到被引用对象时
+        ——bot 走 API 发送的消息不在 NTQQ 本地库 / 旧版客户端只带 seq——
+        replyElement 的查找全失败 → 协议兜底失败 → return null → 上报事件
+        没有任何引用痕迹 → bot 侧 reply_id=None → 群引用跳过 AI 对话的
+        逻辑失效（606573081 群引用 bot 消息仍触发回复的真机实测）。
+
+        修复：把 replyElement 末尾唯一的 return null（锚点"协议兜底未找到
+        匹配的引用消息"之后）替换为弱引用段 {type:"reply", data:{id:"0",seq}}：
+        - bot 解析 id=0 → reply_id=0 → "引用跳过"生效（原设计即所有群引用
+          跳过 AI 对话，本补丁只恢复"查不到引用对象"那部分的行为）
+        - send 层（sender.send_reply）已同步过滤 id=0，不会发出无效引用段
+        - 幂等：特征子串 "seq: String(e.replayMsgSeq" 已存在则跳过；
+          NapCat 升级（mjs 恢复原样）后自动重打
+        - node --check 语法自检（无 node 环境跳过，纯文本替换已实测）
+        """
+        try:
+            with open(mjs, encoding="utf-8") as f:
+                content = f.read()
+        except OSError as e:
+            log.warning(f"读取 napcat.mjs 失败（引用补丁跳过）: {e}")
+            return
+        if "seq: String(e.replayMsgSeq" in content:
+            return  # 已打过，幂等
+        anchor = "协议兜底未找到匹配的引用消息"
+        idx = content.find(anchor)
+        if idx < 0:
+            log.warning("napcat.mjs 未找到引用兜底锚点（引用补丁跳过，版本结构有变）")
+            return
+        if content.find(anchor, idx + len(anchor)) >= 0:
+            log.warning("napcat.mjs 引用兜底锚点不唯一（引用补丁跳过，需人工检查）")
+            return
+        old = "return null;"
+        ret_i = content.find(old, idx)
+        if ret_i < 0:
+            log.warning("napcat.mjs 锚点后未找到 return null（引用补丁跳过）")
+            return
+        # 结构自检：return null 之后 200 字符内应有处理器结束符 "},"
+        if "}," not in content[ret_i + len(old):ret_i + len(old) + 200]:
+            log.warning("napcat.mjs 返回点结构可疑（引用补丁跳过，需人工检查）")
+            return
+        new = ('return { type: ze.reply, data: { id: "0", '
+               'seq: String(e.replayMsgSeq ?? "") } };')
+        patched = content[:ret_i] + new + content[ret_i + len(old):]
+        # 语法自检（node --check；.tmp 扩展名不被 node 识别，用 .mjs 后缀）
+        import subprocess, tempfile
+        tfp = None
+        try:
+            with tempfile.NamedTemporaryFile("w", suffix=".mjs",
+                                             delete=False, encoding="utf-8") as tf:
+                tf.write(patched)
+                tfp = tf.name
+            r = subprocess.run(["node", "--check", tfp],
+                               capture_output=True, text=True, timeout=60)
+            if r.returncode != 0:
+                log.warning(f"引用补丁 node --check 未通过，放弃写入: {r.stderr[:200]}")
+                return
+        except FileNotFoundError:
+            pass  # 无 node 环境，跳过自检（纯文本替换结构已实测验证）
+        finally:
+            if tfp and os.path.exists(tfp):
+                os.unlink(tfp)
+        with open(mjs, "w", encoding="utf-8") as f:
+            f.write(patched)
+        try:
+            with open(marker, "a", encoding="utf-8") as f:
+                f.write(f"quote=1 at {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+        except OSError:
+            pass
+        log.info("🩹 napcat.mjs 引用消息弱引用兜底补丁已写入 (id=0+seq)")
 
     def download(self) -> dict:
         """从 GitHub Release 下载绿色版 zip 并解压到 win_package_dir。"""

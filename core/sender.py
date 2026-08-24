@@ -375,7 +375,9 @@ async def send_reply(
     segments: list[dict] = []
 
     # 引用回复
-    if reply_id is not None:
+    # 2026-08-24：弱引用（id=0，NapCat 查不到被引用对象时上报）不发引用段——
+    # id=0 是无效引用，QQ 端显示异常。正常引用 id 恒为正整数，if reply_id 零副作用。
+    if reply_id:
         segments.append({"type": "reply", "data": {"id": str(reply_id)}})
 
     # @ 提及发送者（后面加一个空格）
