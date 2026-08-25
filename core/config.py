@@ -147,6 +147,11 @@ DEFAULTS = {
         # Windows 绿色版缓存目录（mode=win 时程序自动下载到此处，
         # 解压后自包含：node.exe + QQ 运行时 + NapCat，离线可复用）
         "win_package_dir": "data/napcat_win",
+        # Linux 绿色版内置目录（Ubuntu 发行包随包携带的 NapCat 运行时：
+        # QQ Linux 客户端 + NapCat.Shell + Xvfb/ffmpeg + 系统库闭包。
+        # 相对项目根；auto 模式下该目录存在 → 自动走 linux 后端（免 docker）。
+        # 非发行包部署留空 → auto 落 docker（保持旧行为）。
+        "linux_package_dir": "",
         # Windows 绿色版下载地址（官方 Release 的 Win Node 绿色版 zip，
         # 内置 QQ 无需另装；钉住版本号保证行为可预期，升级时改这里）
         "win_download_url": "https://github.com/NapNeko/NapCatQQ/releases/download/v4.18.19/NapCat.Shell.Windows.Node.zip",
@@ -672,6 +677,7 @@ def _flatten_yaml(cfg: dict) -> dict:
         "NAPCAT_WS_TOKEN": str(cfg["napcat"]["ws_token"]),
         "NAPCAT_CONFIG_DIR": _abs(cfg["napcat"].get("config_dir", "")),
         "NAPCAT_WIN_PACKAGE_DIR": _abs(cfg["napcat"]["win_package_dir"]),
+        "NAPCAT_LINUX_PACKAGE_DIR": _abs(cfg["napcat"].get("linux_package_dir", "")),
         "NAPCAT_WIN_DOWNLOAD_URL": str(cfg["napcat"]["win_download_url"]),
         "NAPCAT_CONSOLE_PORT": int(cfg["napcat"]["console_port"]),
         "NAPCAT_ONEBOT_HTTP_PORT": int(cfg["napcat"]["onebot_http_port"]),

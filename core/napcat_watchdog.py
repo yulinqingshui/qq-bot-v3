@@ -263,9 +263,9 @@ async def awaiting_login_scan() -> bool:
     now = time.time()
     if now - _scan_cache[0] < 10:
         return _scan_cache[1]
-    # 08-23：win 绿色版后端无 docker，走本地日志 + 本地码文件双信号
+    # 绿色版后端（win/linux）无 docker，走本地日志 + 本地码文件双信号
     from . import napcat_manager
-    if napcat_manager.resolve_mode() == "win":
+    if napcat_manager.resolve_mode() in ("win", "linux"):
         hit, why = await _awaiting_scan_win()
         _scan_cache = (now, hit)
         _scan_why = why
@@ -352,11 +352,11 @@ def _qrcode_fresh(container: str, max_age: int = 300) -> bool:
 
 
 async def _awaiting_scan_win() -> tuple[bool, str]:
-    """Win 绿色版后端的待扫码检测（2026-08-23，无 docker 版本）。
+    """绿色版后端（win/linux）的待扫码检测（2026-08-23，无 docker 版本）。
 
     双信号 OR（与 docker 版语义对齐）：
-      1) 本地 napcat_win.log 尾部 6000 字符含 _SCAN_MARKERS
-         （node 子进程 stdout 全量重定向到此文件，与 docker logs 等价）
+      1) 本地 napcat_win.log / napcat_linux.log 尾部 6000 字符含 _SCAN_MARKERS
+         （子进程 stdout 全量重定向到此文件，与 docker logs 等价）
       2) 本地数据目录内 qrcode.png mtime 新鲜（复用 napcat_manager
          .status() 的 _find_qr 递归扫描，码文件位置随版本漂移也不怕）
     两路都读不到 → True（保守放行，与 docker 版一致：宁可漏杀不可误杀，
@@ -364,19 +364,20 @@ async def _awaiting_scan_win() -> tuple[bool, str]:
     """
     from .config import CONFIG
     from . import napcat_manager
-    # 信号 1：本地日志 marker
-    log_path = os.path.join(
-        CONFIG.get("NAPCAT_DATA_DIR") or "", "napcat_win.log")
+    # 信号 1：本地日志 marker（win=napcat_win.log，linux=napcat_linux.log）
+    data_root = CONFIG.get("NAPCAT_DATA_DIR") or ""
+    log_paths = [os.path.join(data_root, n)
+                 for n in ("napcat_win.log", "napcat_linux.log")]
     logs_readable = False
     marker_hit = False
     try:
         loop = asyncio.get_running_loop()
-        out = await loop.run_in_executor(
-            None, lambda: open(log_path, encoding="utf-8",
-                                errors="replace").read()[-6000:]
-            if os.path.isfile(log_path) else "")
-        logs_readable = bool(out)
-        marker_hit = logs_readable and any(m in out for m in _SCAN_MARKERS)
+        tail = await loop.run_in_executor(
+            None, lambda: "".join(
+                open(p, encoding="utf-8", errors="replace").read()[-6000:]
+                for p in log_paths if os.path.isfile(p)))
+        logs_readable = bool(tail)
+        marker_hit = logs_readable and any(m in tail for m in _SCAN_MARKERS)
     except Exception:
         logs_readable = False
         marker_hit = False

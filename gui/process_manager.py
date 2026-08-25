@@ -224,7 +224,7 @@ class BotProcessManager(QThread):
         while True:
             running, attached, pid = self.running_detail()
             self.state_changed.emit(running, attached, pid, "轮询")
-            if not running and self._stop_requested:
+            if self._stop_requested:
                 break
             self.msleep(1500)
 
@@ -237,6 +237,9 @@ class BotProcessManager(QThread):
         （日志走 data/bot.log 文件，GUI 管道断写被 logging 吞掉）。
         """
         self._stop_requested = True
+        # 等轮询线程真正退出再返回（否则解释器收尾销毁仍运行的
+        # QThread → SIGABRT core dump；2026-08-25 发行版冒烟抓到）
+        self.wait(3000)
         if not kill_bot:
             return
         if self.proc is not None and self.proc.poll() is None:

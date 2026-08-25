@@ -65,10 +65,20 @@ def _is_windows() -> bool:
 
 
 def resolve_mode() -> str:
-    """mode: auto → 按平台落成 docker/win；其他值原样返回。"""
+    """mode: auto → 按平台落成 win/linux/docker；其他值原样返回。
+
+    Linux auto 决策（2026-08-25 Ubuntu 发行版）：
+      - 配置了 napcat.linux_package_dir 且 QQ 客户端存在 → linux（绿色版，免 docker）
+      - 否则 → docker（旧部署行为不变）
+    """
     mode = str(CONFIG.get("NAPCAT_MODE", "auto")).lower()
     if mode == "auto":
-        return "win" if _is_windows() else "docker"
+        if _is_windows():
+            return "win"
+        pkg = str(CONFIG.get("NAPCAT_LINUX_PACKAGE_DIR", "") or "")
+        if pkg and os.path.isfile(os.path.join(pkg, "QQ", "qq")):
+            return "linux"
+        return "docker"
     return mode
 
 
@@ -1316,6 +1326,428 @@ class WinGreenBackend:
 
 
 # ============================================================
+#  Linux 绿色版后端（Ubuntu 发行版，2026-08-25）
+# ============================================================
+class LinuxGreenBackend:
+    """
+    Linux 绿色版（免 docker）：内置 QQ Linux 客户端（预注入 NapCat hook）
+    + NapCat.Shell，原生进程启动。Ubuntu 发行包随包携带全部运行时
+    （QQ 客户端 / Xvfb / ffmpeg / gstreamer / 系统 .so 闭包 / 中文字体），
+    目标机零系统依赖（只需 glibc 基础库，任意 Ubuntu 20.04+ 自带）。
+
+    目录结构（发行包 napcat_linux/，2026-08-25 本机实测验证）：
+      QQ/qq                         Linux QQ 客户端（Electron，已注入 hook）
+      QQ/resources/app/loadNapCat.js  hook 入口（相对路径 import napcat.mjs）
+      QQ/resources/app/wrapper.node   QQ 协议栈
+      napcat/napcat.mjs               NapCat.Shell 本体
+      libs/                           系统 .so 闭包（GTK/X11/Qt/gst/ffmpeg…）
+      bin/Xvfb  bin/ffmpeg  bin/ffprobe
+      fonts/                          中文字体（文泉驿 + DejaVu）
+      home/                           运行时 HOME（首启创建）：
+                                      QQ 登录态 .config/QQ、fontconfig 缓存、
+                                      运行时生成的 fonts.conf
+      data/                           NAPCAT_WORKDIR：
+                                      config/webui.json、config/onebot11*.json、
+                                      cache/qrcode.png、passkey.json、日志
+
+    运行时行为（与 mlikiowa/napcat-docker 镜像 entrypoint 对齐）：
+      1) Xvfb :1 -screen 0 1080x760x16 +extension GLX +render（虚拟显示）
+      2) QQ --no-sandbox [-q <uin>]，env：
+         HOME=<pkg>/home  LD_LIBRARY_PATH=<pkg>/libs  DISPLAY=:1
+         NAPCAT_WORKDIR=<pkg>/data  FFMPEG_PATH=<pkg>/bin/ffmpeg
+         FONTCONFIG_FILE=<pkg>/home/fonts.conf（首启自动生成）
+      3) stdout/stderr → data/napcat_linux.log
+    数据自包含：登录态/登录凭证/日志全在 <pkg> 内，包整体拷走即迁移。
+    """
+    name = "linux"
+
+    _LOADER_TEMPLATE = (
+        "const p = require('path');\n"
+        "(async () => { await import(p.join(__dirname, "
+        "'../../../napcat/napcat.mjs')); })();\n"
+    )
+
+    def __init__(self):
+        self.pkg_dir = str(CONFIG.get("NAPCAT_LINUX_PACKAGE_DIR", "") or "")
+        self.data_dir = str(CONFIG.get("NAPCAT_DATA_DIR", "") or "")
+        self.home_dir = os.path.join(self.pkg_dir, "home") if self.pkg_dir else ""
+        self.display = ":97"  # 独立显示号（容器镜像用 :1，用户桌面实例常用 :99）
+        self._proc: subprocess.Popen | None = None    # QQ（含 NapCat hook）
+        self._xvfb: subprocess.Popen | None = None    # 虚拟显示
+
+    # ---- 就绪检测 ----
+    def _qq_bin(self) -> str:
+        return os.path.join(self.pkg_dir, "QQ", "qq")
+
+    def _green_ready(self) -> bool:
+        return (os.path.isfile(self._qq_bin())
+                and os.path.isfile(os.path.join(self.pkg_dir, "napcat", "napcat.mjs"))
+                and os.path.isfile(os.path.join(self.pkg_dir, "bin", "Xvfb")))
+
+    def _alive(self) -> bool:
+        return self._proc is not None and self._proc.poll() is None
+
+    # ---- 首启自修 ----
+    def _patch_loader(self) -> None:
+        """把 QQ hook 入口改成相对路径 import（发行包解压位置无关）。
+
+        镜像内原版硬编码 file:///app/napcat/napcat.mjs（容器路径），
+        绿色版必须相对定位到 <pkg>/napcat/napcat.mjs。幂等：已是
+        相对路径直接跳过；内容含 /app/ 前缀则重写。
+        """
+        loader = os.path.join(self.pkg_dir, "QQ", "resources", "app",
+                              "loadNapCat.js")
+        if not os.path.isfile(loader):
+            log.warning(f"未找到 QQ hook 入口 {loader}（发行包结构异常）")
+            return
+        try:
+            with open(loader, encoding="utf-8") as f:
+                content = f.read()
+            if "require('path')" in content and "'/app/" not in content \
+                    and "file:///" not in content:
+                return  # 已就绪
+        except OSError:
+            pass
+        try:
+            with open(loader, "w", encoding="utf-8") as f:
+                f.write(self._LOADER_TEMPLATE)
+            log.info("🩹 loadNapCat.js 已改为相对路径 import（发行包自修）")
+        except OSError as e:
+            log.warning(f"写 loadNapCat.js 失败: {e}")
+
+    def _ensure_fonts_conf(self) -> None:
+        """首启生成 fontconfig 主配置（绝对路径指向包内字体）。
+
+        fontconfig 不支持 $ORIGIN 展开，而发行包解压位置不定 →
+        运行时按 pkg 绝对路径生成 <pkg>/home/fonts.conf，
+        之后 env FONTCONFIG_FILE 指向它。幂等：已存在不重写
+        （用户可手动调字体优先级）。
+        """
+        conf = os.path.join(self.home_dir, "fonts.conf")
+        if os.path.isfile(conf):
+            return
+        pkg = self.pkg_dir
+        xml = (
+            '<?xml version="1.0"?>\n'
+            '<!DOCTYPE fontconfig SYSTEM "fonts.dtd">\n'
+            '<fontconfig>\n'
+            f'  <dir>{pkg}/fonts</dir>\n'
+            f'  <cachedir>{pkg}/home/.cache/fontconfig</cachedir>\n'
+            '  <config>\n    <rescan>0</rescan>\n  </config>\n'
+            '</fontconfig>\n'
+        )
+        try:
+            os.makedirs(self.home_dir, exist_ok=True)
+            with open(conf, "w", encoding="utf-8") as f:
+                f.write(xml)
+        except OSError as e:
+            log.warning(f"生成 fonts.conf 失败: {e}")
+
+    def _env(self) -> dict:
+        pkg = self.pkg_dir
+        env = dict(os.environ)
+        env["HOME"] = self.home_dir
+        # 系统库闭包（QQ/Xvfb/gstreamer/ffmpeg 依赖全在包内 libs/）
+        env["LD_LIBRARY_PATH"] = os.path.join(pkg, "libs")
+        env["DISPLAY"] = self.display
+        env["NAPCAT_WORKDIR"] = self.data_dir
+        env["NAPCAT_DISABLE_PIPE"] = "1"
+        env["FFMPEG_PATH"] = os.path.join(pkg, "bin", "ffmpeg")
+        env["PATH"] = os.path.join(pkg, "bin") + os.pathsep + env.get("PATH", "")
+        env["FONTCONFIG_FILE"] = os.path.join(self.home_dir, "fonts.conf")
+        # 缓存/配置全收进包内 HOME（XDG 默认值）
+        env["XDG_DATA_HOME"] = os.path.join(self.home_dir, ".local", "share")
+        env["XDG_CACHE_HOME"] = os.path.join(self.home_dir, ".cache")
+        env["XDG_CONFIG_HOME"] = os.path.join(self.home_dir, ".config")
+        env["QT_QPA_PLATFORM"] = "xcb"
+        return env
+
+    def _display_alive(self) -> bool:
+        """Xvfb 显示是否可用（unix socket 探测；包内 Xvfb 或系统自带均可）。
+
+        僵尸 socket 自愈（2026-08-25 整包实测）：崩溃残留的 socket 文件
+        在但 connect 被拒 → 删掉死文件返回 False（否则 Xvfb 重绑失败）。
+        """
+        import socket
+        n = int(self.display.lstrip(":") or "0")
+        sock = os.path.join("/tmp", ".X11-unix", f"X{n}")
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.connect(sock)
+            s.close()
+            return True
+        except OSError:
+            # 死 socket 文件：删掉让 Xvfb 能重新绑定
+            try:
+                if os.path.exists(sock):
+                    os.unlink(sock)
+                    log.warning(f"🧹 清理僵尸 X socket: {sock}")
+            except OSError:
+                pass
+            return False
+
+    # ---- onebot11 配置（与 win 后端同语义：默认桥 + 空网络自愈）----
+    def _write_onebot_config(self) -> None:
+        cfg_dir = os.path.join(self.data_dir, "config")
+        listen_port = int(CONFIG.get("LISTEN_PORT", 8696))
+        ws_url = f"ws://127.0.0.1:{listen_port}/"
+        _write_default_onebot11(cfg_dir, ws_url)
+        default_net = _build_onebot11_config(ws_url)
+        if not os.path.isdir(cfg_dir):
+            return
+        for f in sorted(os.listdir(cfg_dir)):
+            if not (f.startswith("onebot11_") and f.endswith(".json")):
+                continue
+            p = os.path.join(cfg_dir, f)
+            try:
+                with open(p, encoding="utf-8") as fh:
+                    data = json.load(fh)
+                net = data.get("network") or {}
+                if net.get("httpServers") or net.get("websocketClients"):
+                    continue
+                bak = p + ".pre_fix"
+                if not os.path.exists(bak):
+                    os.replace(p, bak)
+                with open(p, "w", encoding="utf-8") as fh:
+                    json.dump(default_net, fh, ensure_ascii=False, indent=2)
+                log.warning(f"🔧 onebot11 账号配置空网络已自愈: {f}")
+            except Exception as e:
+                log.warning(f"⚠️ 自愈 onebot11 配置失败 {f}: {e}")
+
+    def _detect_quick_uin(self) -> str:
+        """探测可快速登录的 QQ uin（与 win 后端同逻辑：重启后免扫码）。"""
+        try:
+            cfg_dir = os.path.join(self.data_dir, "config")
+            if os.path.isdir(cfg_dir):
+                for f in sorted(os.listdir(cfg_dir)):
+                    m = re.match(r"onebot11_(\d+)\.json$", f)
+                    if m:
+                        return m.group(1)
+        except OSError:
+            pass
+        try:
+            sf = os.path.join(os.path.dirname(os.path.dirname(__file__)),
+                              "data", "napcat_status.txt")
+            if os.path.isfile(sf):
+                for line in open(sf, encoding="utf-8", errors="replace"):
+                    if line.startswith("account:"):
+                        m = re.search(r"\((\d+)\)", line)
+                        if m:
+                            return m.group(1)
+        except OSError:
+            pass
+        return ""
+
+    # ---- 进程管理 ----
+    def _kill_orphans(self) -> int:
+        """杀掉属于本包的孤儿进程（/proc 扫描，按命令行路径匹配）。
+
+        2026-08-25 整包实测：上次异常退出遗留的 QQ 主进程占着
+        SingletonLock，新实例检测到锁被占直接退出（日志停在 bootstrap）；
+        孤儿 Xvfb 也会占显示 socket 导致新实例复用僵尸显示。
+        只杀自己 Popen 的子进程不够，必须按包路径清孤儿。
+        """
+        import signal
+        markers = (os.path.join(self.pkg_dir, "QQ", "qq"),
+                   os.path.join(self.pkg_dir, "bin", "Xvfb"))
+        killed = 0
+        try:
+            for pid in os.listdir("/proc"):
+                if not pid.isdigit():
+                    continue
+                try:
+                    with open(f"/proc/{pid}/cmdline", "rb") as f:
+                        cmd = f.read().decode("utf-8", "replace")
+                except OSError:
+                    continue
+                if any(m in cmd for m in markers):
+                    try:
+                        os.kill(int(pid), signal.SIGKILL)
+                        killed += 1
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        if killed:
+            log.warning(f"🧹 清理孤儿进程 {killed} 个（QQ/Xvfb，防 SingletonLock"
+                        f"/僵尸显示残留）")
+            time.sleep(1)
+        return killed
+
+    def _spawn(self) -> str:
+        if not self._green_ready():
+            return ("Linux 绿色版未就绪（napcat.linux_package_dir 未配置或"
+                    "目录不完整；发行包应内置 napcat_linux/）")
+        os.makedirs(self.data_dir, exist_ok=True)
+        os.makedirs(self.home_dir, exist_ok=True)
+        # 先清孤儿（旧实例 SingletonLock 会挡新启动）
+        self._kill_orphans()
+        self._write_onebot_config()
+        self._patch_loader()
+        self._ensure_fonts_conf()
+        env = self._env()
+        # 1) 虚拟显示（已可用则复用，例如系统自带 Xvfb）
+        if not self._display_alive():
+            try:
+                logf = open(os.path.join(self.data_dir, "xvfb.log"), "ab")
+                self._xvfb = subprocess.Popen(
+                    [os.path.join(self.pkg_dir, "bin", "Xvfb"),
+                     self.display, "-screen", "0", "1080x760x16",
+                     "+extension", "GLX", "+render", "-nolisten", "tcp"],
+                    env=env, stdout=logf, stderr=subprocess.STDOUT,
+                    start_new_session=True)
+                logf.close()
+            except Exception as e:
+                return f"Xvfb 启动失败: {e}"
+            # 等显示 socket 就绪（最多 5s）
+            for _ in range(25):
+                if self._display_alive():
+                    break
+                time.sleep(0.2)
+            else:
+                return f"Xvfb 未就绪（{self.display} 无响应，见 data/xvfb.log）"
+        # 2) QQ 客户端（内嵌 NapCat hook，登录态/数据全落包内）
+        quick_uin = self._detect_quick_uin()
+        cmd = [self._qq_bin(), "--no-sandbox"]
+        if quick_uin:
+            cmd += ["-q", quick_uin]
+            log.info(f"🔑 NapCat 快速登录探测: uin={quick_uin}（-q）")
+        else:
+            log.info("🔑 NapCat 未发现历史登录 uin，本次走二维码登录流程")
+        try:
+            logf = open(os.path.join(self.data_dir, "napcat_linux.log"), "ab")
+            self._proc = subprocess.Popen(
+                cmd, cwd=os.path.dirname(self._qq_bin()), env=env,
+                stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+            logf.close()
+        except Exception as e:
+            return f"QQ 客户端启动失败: {e}"
+        return ""
+
+    def _kill(self, proc: subprocess.Popen | None) -> None:
+        """杀进程组（start_new_session 起独立会话，QQ 的 zygote/render 子进程
+        全在组内；只杀主进程会留孤儿占 SingletonLock）。"""
+        import signal
+        if proc is None or proc.poll() is not None:
+            return
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+            proc.wait(timeout=8)
+        except Exception:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+
+    def ensure_running(self) -> dict:
+        if self._alive():
+            return {"ok": True, "message": "Linux 绿色版运行中"}
+        err = self._spawn()
+        if err or self._proc is None:
+            return {"ok": False, "error": err or "QQ 进程未拉起"}
+        log.info(f"🚀 NapCat(linux) 已启动 pid={self._proc.pid} "
+                 f"workdir={self.data_dir}")
+        return {"ok": True, "message": f"绿色版已启动 (pid {self._proc.pid})"}
+
+    def status(self) -> dict:
+        if not self.pkg_dir:
+            return _build_status(False, "napcat.linux_package_dir 未配置",
+                                 backend=self.name)
+        if not self._green_ready():
+            return _build_status(
+                False, f"Linux 绿色版目录不完整: {self.pkg_dir}",
+                backend=self.name)
+        b64, mtime = _find_qr(self.data_dir)
+        return _build_status(self._alive(), "", b64, mtime, backend=self.name)
+
+    def restart(self, force: bool = False) -> dict:
+        from .sender import _active_websocket
+        if not force and _active_websocket is not None:
+            return {"ok": False, "error": "NapCat 已连接，无需刷新（重启会断开 QQ）"}
+        self._kill(self._proc)
+        self._proc = None
+        time.sleep(1)
+        err = self._spawn()
+        if err or self._proc is None:
+            return {"ok": False, "error": err or "QQ 进程未拉起"}
+        log.info(f"🔄 NapCat(linux) 已重启（刷新二维码）pid={self._proc.pid}")
+        return {"ok": True, "message": "绿色版已重启，10 秒后刷新二维码"}
+
+    def logout(self) -> dict:
+        """注销：停 QQ 进程 + 清全部登录凭证 → 下次启动出二维码。
+
+        凭证落点（绿色版数据自包含，全在包内）：
+          - passkey*.json（NapCat 扫码登录态）：data_dir 内递归
+          - webui.json 的 autoLoginAccount：data_dir/config/
+          - QQ 客户端登录态：home/.config/QQ（整树）
+        之后 bot 侧同步复位（主账号记录 + 账号桥全开）。
+        """
+        if not self._alive():
+            return {"ok": False, "error": "NapCat 未运行，无法注销"}
+        self._kill(self._proc)
+        self._proc = None
+        time.sleep(1)
+        removed = []
+        try:
+            for dirpath, _dirs, files in os.walk(self.data_dir):
+                for f in files:
+                    if f.lower().startswith("passkey") and f.lower().endswith(".json"):
+                        p = os.path.join(dirpath, f)
+                        os.remove(p)
+                        removed.append(p)
+        except OSError as e:
+            log.warning(f"清理登录态文件失败: {e}")
+        try:
+            wp = os.path.join(self.data_dir, "config", "webui.json")
+            if os.path.isfile(wp):
+                with open(wp, encoding="utf-8") as f:
+                    wd = json.load(f)
+                if wd.get("autoLoginAccount"):
+                    wd["autoLoginAccount"] = ""
+                    with open(wp, "w", encoding="utf-8") as f:
+                        json.dump(wd, f, ensure_ascii=False, indent=4)
+        except Exception as e:
+            log.warning(f"清 webui autoLoginAccount 失败: {e}")
+        qq_removed = 0
+        qq_dirs = [os.path.join(self.home_dir, ".config", "QQ")]
+        for d in qq_dirs:
+            if os.path.isdir(d):
+                try:
+                    shutil.rmtree(d)
+                    qq_removed += 1
+                except OSError as e:
+                    log.warning(f"清理 QQ 数据目录失败 {d}: {e}")
+        if not qq_removed:
+            log.warning("未找到 QQ 登录态目录（home/.config/QQ）——"
+                        "若注销后回登旧账号，请手动检查 napcat_linux/home/")
+        notes = [f"passkey 已清 {len(removed)} 个", f"QQ 登录态目录已清 {qq_removed} 个"]
+        notes.extend(_reset_bot_side_after_logout())
+        log.info(f"👋 NapCat(linux) 已注销（全清凭证）: {' | '.join(notes)}")
+        return {"ok": True,
+                "cleared": notes,
+                "message": "已注销并清空全部登录凭证，点「刷新二维码」重新启动并扫码"
+                           "（原有账号也需重新扫码，可扫任意账号）"}
+
+    def stop(self) -> dict:
+        """停 QQ + Xvfb（bot 退出收尾；不清登录凭据，与 logout 区分）。
+
+        2026-08-25：先杀自己持有的进程组，再按包路径清孤儿
+        （跨进程/重启场景下 Popen 引用丢失的兜底）。
+        """
+        self._kill(self._proc)
+        self._proc = None
+        self._kill(self._xvfb)
+        self._xvfb = None
+        self._kill_orphans()
+        log.info("🛑 NapCat(linux) 子进程已停止（bot 退出收尾）")
+        return {"ok": True, "message": "已停止"}
+
+
+# ============================================================
 #  统一入口
 # ============================================================
 _backend_cache: dict = {}
@@ -1331,6 +1763,7 @@ def _backend():
         _backend_cache[mode] = {
             "docker": DockerBackend(),
             "win": WinGreenBackend(),
+            "linux": LinuxGreenBackend(),
         }[mode]
     return mode, _backend_cache[mode]
 
